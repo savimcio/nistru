@@ -9,12 +9,11 @@ The gate is `make ci`. It runs in under thirty seconds with `-race` enabled, and
 ## Pyramid
 
 ```
-    +-- TUI e2e (teatest, goldens) --+   model_e2e_test.go (//go:build e2e)
-    |     ~20%                       |   testdata/golden/
-    +-- Component (Model.Update,   --+   model_component_test.go
+    +-- TUI e2e (teatest, goldens) --+   internal/editor/model_e2e_test.go (//go:build e2e)
+    |     ~20%                       |   internal/editor/testdata/golden/
+    +-- Component (Model.Update,   --+   internal/editor/model_component_test.go
     |   Host direct)   ~40%         |   plugin/host_test.go, gaps_test.go
-    +-- Unit (pure helpers)   ~30% -+   palette_test.go, autosave_test.go,
-    |                              |   model_test.go, editor_test.go,
+    +-- Unit (pure helpers)   ~30% -+   internal/editor/{palette,autosave,model,editor}_test.go,
     |                              |   plugin/{activation,manifest,protocol}_test.go
     +-- Non-functional sweeps ~10%-+   fuzz_test.go, -race, staticcheck, vet
 ```
@@ -23,9 +22,9 @@ The gate is `make ci`. It runs in under thirty seconds with `-race` enabled, and
 
 Three lines decide where a new test goes:
 
-- **Pure function, no `tea.Msg`, no I/O** -> **Unit**. Lives next to the code. See [`palette_test.go`](../palette_test.go), [`autosave_test.go`](../autosave_test.go), [`plugin/activation_test.go`](../plugin/activation_test.go), [`plugin/manifest_test.go`](../plugin/manifest_test.go), [`plugin/protocol_test.go`](../plugin/protocol_test.go).
-- **Calls `Model.Update(msg)` or `plugin.Host.Emit`/`ExecuteCommand` but never starts a `tea.Program`** -> **Component**. See [`model_component_test.go`](../model_component_test.go), [`plugin/host_test.go`](../plugin/host_test.go), [`plugin/gaps_test.go`](../plugin/gaps_test.go).
-- **Starts a real program via `teatest.NewTestModel`** -> **E2E**. Lives under the `//go:build e2e` tag so the default `go test` stays fast. See [`model_e2e_test.go`](../model_e2e_test.go).
+- **Pure function, no `tea.Msg`, no I/O** -> **Unit**. Lives next to the code. See [`internal/editor/palette_test.go`](../internal/editor/palette_test.go), [`internal/editor/autosave_test.go`](../internal/editor/autosave_test.go), [`plugin/activation_test.go`](../plugin/activation_test.go), [`plugin/manifest_test.go`](../plugin/manifest_test.go), [`plugin/protocol_test.go`](../plugin/protocol_test.go).
+- **Calls `Model.Update(msg)` or `plugin.Host.Emit`/`ExecuteCommand` but never starts a `tea.Program`** -> **Component**. See [`internal/editor/model_component_test.go`](../internal/editor/model_component_test.go), [`plugin/host_test.go`](../plugin/host_test.go), [`plugin/gaps_test.go`](../plugin/gaps_test.go).
+- **Starts a real program via `teatest.NewTestModel`** -> **E2E**. Lives under the `//go:build e2e` tag so the default `go test` stays fast. See [`internal/editor/model_e2e_test.go`](../internal/editor/model_e2e_test.go).
 
 When in doubt, drop one tier: a component test that exercises a state transition is almost always more useful than the e2e flow around it. The trade-off: component tests run in microseconds and catch state-machine regressions directly; e2e tests run in tens of milliseconds each and catch only the bugs that survive `Update` but manifest at `View`.
 
@@ -34,8 +33,8 @@ When in doubt, drop one tier: a component test that exercises a state transition
 The numbers to beat are recorded in the plan and enforced by eyeball, not by CI gate:
 
 - `plugin/` >= 64% (T2 baseline).
-- `plugins/treepane/` >= 77%.
-- Root package >= 65% (currently 68.6%).
+- `internal/plugins/treepane/` >= 77%.
+- `internal/editor/` >= 65% (currently 68.6%).
 - `sdk/plugsdk` + `sdk/plugsdk/plugintest` combined >= 80%.
 
 If your PR drops a number, raise a new test rather than lower the floor.
@@ -59,7 +58,7 @@ All targets are declared in the [Makefile](../Makefile). Authoritative list live
 
 ## Golden files
 
-E2E snapshots live under [`testdata/golden/`](../testdata/golden/). The runner in [`model_e2e_test.go`](../model_e2e_test.go) normalises output (strips ANSI, trims trailing whitespace per line, collapses `\r\n` to `\n`) before diffing, so environment colour differences do not break the suite.
+E2E snapshots live under [`internal/editor/testdata/golden/`](../internal/editor/testdata/golden/). The runner in [`internal/editor/model_e2e_test.go`](../internal/editor/model_e2e_test.go) normalises output (strips ANSI, trims trailing whitespace per line, collapses `\r\n` to `\n`) before diffing, so environment colour differences do not break the suite.
 
 Regenerate a golden after a legitimate `View()` change:
 
@@ -95,7 +94,7 @@ go test -run=^$ -fuzz=^FuzzCodec$ -fuzztime=30s ./plugin/
 
 Recipe:
 
-1. Build a `*Model` via a test helper (`newTestModel(t, dir)` in [`model_component_test.go`](../model_component_test.go)).
+1. Build a `*Model` via a test helper (`newTestModel(t, dir)` in [`internal/editor/model_component_test.go`](../internal/editor/model_component_test.go)).
 2. Craft a `tea.Msg` that represents the event you want to test.
 3. Call `m.Update(msg)`.
 4. Assert returned model state; drain the returned `tea.Cmd` if the flow needs a follow-up message.
@@ -112,7 +111,7 @@ if got.dirty {
 _ = cmd // drain if the test needs the follow-up msg
 ```
 
-Canonical example: [`model_component_test.go`](../model_component_test.go). Use it as the template for any new flow.
+Canonical example: [`internal/editor/model_component_test.go`](../internal/editor/model_component_test.go). Use it as the template for any new flow.
 
 For component tests that need a live out-of-process plugin without the cost of a full e2e build, `plugin/host_test.go` has a `PLUGIN_MODE` self-spawn pattern: the test binary re-executes itself with an env var set, and an `init()` branch runs a minimal plugin main. Reuse it; do not reinvent the subprocess dance.
 
@@ -138,7 +137,7 @@ teatest.WaitFor(t, tm.Output(), func(b []byte) bool {
 }, teatest.WithCheckInterval(5*time.Millisecond), teatest.WithDuration(time.Second))
 ```
 
-Canonical example: [`model_e2e_test.go`](../model_e2e_test.go).
+Canonical example: [`internal/editor/model_e2e_test.go`](../internal/editor/model_e2e_test.go).
 
 ## Testing your plugin
 

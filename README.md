@@ -15,7 +15,7 @@ A minimal terminal text editor with a file-tree sidebar, modal vim-style editing
 ## Install
 
 ```sh
-go install github.com/savimcio/nistru@latest
+go install github.com/savimcio/nistru/cmd/nistru@latest
 ```
 
 Or build from source:
@@ -23,7 +23,7 @@ Or build from source:
 ```sh
 git clone https://github.com/savimcio/nistru.git
 cd nistru
-go build
+go build -o nistru ./cmd/nistru
 ./nistru
 ```
 

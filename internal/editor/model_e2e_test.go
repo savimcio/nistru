@@ -23,7 +23,7 @@
 //   - Keep each scripted flow under ~200 ms wall time where feasible. Flows
 //     that need the autosave debounce (250 ms × 2) check testing.Short() and
 //     skip when set.
-package main
+package editor
 
 import (
 	"bytes"
@@ -33,6 +33,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -46,7 +47,7 @@ import (
 	"github.com/kujtimiihoxha/vimtea"
 
 	"github.com/savimcio/nistru/plugin"
-	"github.com/savimcio/nistru/plugins/treepane"
+	"github.com/savimcio/nistru/internal/plugins/treepane"
 )
 
 // The `-update` flag is already registered by a transitive dep (one of the
@@ -578,11 +579,7 @@ func buildExamplePlugins(t *testing.T) string {
 		examplePluginsDir = root
 
 		for _, name := range []string{"hello-world", "gofmt"} {
-			srcDir, err2 := filepath.Abs(filepath.Join("examples", "plugins", name))
-			if err2 != nil {
-				examplePluginsErr = err2
-				return
-			}
+			srcDir := filepath.Join(repoRoot(t), "examples", "plugins", name)
 			outDir := filepath.Join(root, name)
 			if err2 := os.MkdirAll(outDir, 0o755); err2 != nil {
 				examplePluginsErr = err2
@@ -921,5 +918,21 @@ func TestE2E_LayoutInvariants(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func repoRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, _ := runtime.Caller(0)
+	dir := filepath.Dir(file)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			t.Fatal("repoRoot: reached filesystem root without finding go.mod")
+		}
+		dir = parent
 	}
 }

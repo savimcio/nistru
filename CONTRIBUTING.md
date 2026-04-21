@@ -18,9 +18,9 @@ cd nistru
 Sanity check:
 
 ```sh
-make test-short   # ~3s; the inner-loop test target
-go build          # produces ./nistru
-./nistru -path .  # open the repo in the editor
+make test-short                 # ~3s; the inner-loop test target
+go build -o nistru ./cmd/nistru # produces ./nistru
+./nistru -path .                # open the repo in the editor
 ```
 
 If both work, you're set.

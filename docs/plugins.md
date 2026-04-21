@@ -176,7 +176,7 @@ Register at startup in `NewModel`:
 registry.RegisterInProc(myplugin.New(root))
 ```
 
-See `plugins/treepane/treepane.go` for a full example.
+See `internal/plugins/treepane/treepane.go` for a full example.
 
 ## Effects
 
