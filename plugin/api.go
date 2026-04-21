@@ -152,3 +152,11 @@ type Plugin interface {
 	// resources. Distinct from the Shutdown event struct.
 	Shutdown() error
 }
+
+// HostAware is an optional extension implemented by in-process plugins that
+// need to call back into the Host from their own goroutines (e.g. to post
+// asynchronous status-bar updates). The Host calls SetHost exactly once,
+// before the Initialize event is dispatched.
+type HostAware interface {
+	SetHost(h *Host)
+}

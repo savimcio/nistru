@@ -7,9 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- First-party `autoupdate` plugin: watches GitHub Releases for new versions, shows an update-available badge in the status bar, and ships palette commands to install, roll back, switch channel (release/dev), check now, and view release notes.
+- Plugin host primitives for in-process async notifications: `plugin.HostAware` interface and `Host.PostNotif(plugin, method, params)` non-blocking notification pump.
+- `nistru -version` flag that prints the running version.
+- Makefile `build` target with `-ldflags -X main.Version=$(git describe ...)` for reproducible version embedding.
+
 ### Changed
 
 - Reorganize repo to modern Go layout: editor core moves to `internal/editor/`, binary entry point to `cmd/nistru/`, first-party plugins to `internal/plugins/`. Public packages (`plugin/`, `sdk/plugsdk/`) unchanged.
+
+### Security
+
+- Auto-update installation is never automatic: palette invocation of `autoupdate:install` is the only path to a binary swap. The scheduled checker only updates the status bar.
 
 ### Breaking
 

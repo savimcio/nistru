@@ -1,5 +1,6 @@
 .claude/
 /nistru
+/bin/
 cmd/nistru/nistru
 /examples/plugins/hello-world/hello-world
 /examples/plugins/gofmt/gofmt-plugin

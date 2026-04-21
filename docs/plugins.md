@@ -178,6 +178,65 @@ registry.RegisterInProc(myplugin.New(root))
 
 See `internal/plugins/treepane/treepane.go` for a full example.
 
+### In-process async notifications
+
+In-process plugins run `OnEvent` on the Bubble Tea goroutine and must return quickly. When work needs to happen in the background — polling a file, watching a socket, running a ticker — spawn a goroutine and report results back to the host via `plugin.Host.PostNotif`.
+
+Opt in by implementing the optional `HostAware` interface. The host calls `SetHost` once, before `Initialize` is dispatched:
+
+```go
+type HostAware interface {
+    SetHost(h *plugin.Host)
+}
+```
+
+`PostNotif` synthesizes a JSON-RPC notification and routes it through the same inbound pipeline that out-of-process plugins use, so the editor model handles it identically regardless of transport:
+
+```go
+func (h *plugin.Host) PostNotif(plugin, method string, params any) error
+```
+
+It's **safe to call from any goroutine** and **non-blocking**: if the inbound buffer is saturated the notification is dropped and an error is returned. Host-side bookkeeping for methods like `commands/register` runs synchronously before the send, so command registration is effective on return even when the send itself drops. Supported methods mirror the wire protocol: `statusBar/set`, `ui/notify`, `commands/register`, `commands/unregister`.
+
+Use it for status-bar updates, toast notifications, and late command registration. Do not call it from an out-of-process plugin — those already have a dedicated writer goroutine.
+
+```go
+type clock struct {
+    host *plugin.Host
+    stop chan struct{}
+}
+
+func (c *clock) Name() string         { return "clock" }
+func (c *clock) Activation() []string { return []string{"onStart"} }
+func (c *clock) SetHost(h *plugin.Host) { c.host = h }
+
+func (c *clock) OnEvent(ev any) []plugin.Effect {
+    if _, ok := ev.(plugin.Initialize); ok {
+        c.stop = make(chan struct{})
+        go c.tick()
+    }
+    return nil
+}
+
+func (c *clock) tick() {
+    t := time.NewTicker(time.Second)
+    defer t.Stop()
+    for {
+        select {
+        case <-c.stop:
+            return
+        case now := <-t.C:
+            _ = c.host.PostNotif("clock", "statusBar/set", map[string]any{
+                "segment": "clock",
+                "text":    now.Format("15:04:05"),
+            })
+        }
+    }
+}
+
+func (c *clock) Shutdown() error { close(c.stop); return nil }
+```
+
 ## Effects
 
 In-process plugin calls return effects; out-of-process plugins send equivalent JSON-RPC notifications. Both flow through the same host plumbing:
@@ -300,6 +359,68 @@ func (p *fmt) OnExecuteCommand(id string, _ json.RawMessage) (any, error) {
 
 The bundled [`gofmt` example](../examples/plugins/gofmt/main.go) currently calls `BufferEdit` synchronously and is vulnerable to this pattern. Its tests work around it by invoking `ExecuteCommand` in a goroutine and asserting against `h.Requests()`. A follow-up should either dispatch handlers on a per-frame goroutine inside the SDK or rewrite the example to spawn.
 
+## Auto-update (first-party example)
+
+The bundled `autoupdate` plugin (under `internal/plugins/autoupdate/`) is the canonical template for any in-process plugin that needs to do work on a schedule. Read it before writing your own background plugin — it exercises every piece of the `HostAware` + `PostNotif` contract end-to-end: a ticker-driven poll loop, a status-bar segment, late palette-command registration, and a `ui/notify` toast when a new release appears.
+
+**Why this pattern exists.** In-process plugins receive events synchronously on the Bubble Tea goroutine. `OnEvent` must return quickly or it will stall the editor's `Update` loop. Anything long-running — an HTTP request, a file watcher, a timer — has to run on its own goroutine. But background goroutines can't safely touch the model directly; they need a way to push changes back through the same pipeline that delivers out-of-process plugin notifications.
+
+That's what `HostAware` + `PostNotif` provide. Implement `SetHost` to capture the host reference, spawn a goroutine from your `Initialize` handler, and call `host.PostNotif` whenever the goroutine has something to report. Under the hood the host synthesizes a JSON-RPC notification and routes it through the same inbound channel used by external plugins, so the editor model's `handlePluginNotif` treats both transports identically.
+
+### Minimal template
+
+```go
+type MyPlugin struct {
+    host *plugin.Host
+}
+
+func (p *MyPlugin) Name() string         { return "myplugin" }
+func (p *MyPlugin) Activation() []string { return []string{"onStart"} }
+func (p *MyPlugin) Shutdown() error      { return nil }
+
+func (p *MyPlugin) SetHost(h *plugin.Host) { p.host = h }
+
+func (p *MyPlugin) OnEvent(event any) []plugin.Effect {
+    if _, ok := event.(plugin.Initialize); ok {
+        go p.backgroundLoop()
+    }
+    return nil
+}
+
+func (p *MyPlugin) backgroundLoop() {
+    tick := time.NewTicker(1 * time.Minute)
+    defer tick.Stop()
+    for range tick.C {
+        _ = p.host.PostNotif("myplugin", "statusBar/set", map[string]string{
+            "segment": "status",
+            "text":    "updated " + time.Now().Format(time.Kitchen),
+            "color":   "cyan",
+        })
+    }
+}
+```
+
+The real `autoupdate` plugin (`internal/plugins/autoupdate/`) fleshes this shape out with a channel-driven stop signal, configurable interval, HTTP client with retry/backoff, SHA-256 verification, and late palette-command registration on first successful poll. It's the recommended reference for any plugin whose work should survive a `Shutdown` cleanly.
+
+### `PostNotif` contract
+
+- **Safe to call from any goroutine.** Internally guarded; you do not need to hold a lock.
+- **Non-blocking.** If the inbound buffer is saturated the notification is dropped and a non-nil error is returned. Do not retry in a tight loop; drop-on-full is the intended backpressure.
+- **Host-side bookkeeping is synchronous.** For methods like `commands/register` / `commands/unregister`, the host updates its command table before the send returns, so a subsequent palette open reflects the change even if the actual notification frame was dropped.
+- **Supported methods today** (see `internal/editor/model.go` `handlePluginNotif`):
+
+  | Method | Effect |
+  |---|---|
+  | `statusBar/set` | upsert a status-bar segment (`{segment, text, color}`) |
+  | `ui/notify` | transient toast in the status area (`{level, message}`) |
+  | `commands/register` | add a palette entry (`{id, title}`) |
+  | `commands/unregister` | remove a palette entry (`{id}`) |
+  | `pane/invalidate` | request a re-render of your pane |
+
+  Any other method name is ignored by the model; check `handlePluginNotif` before shipping a new verb.
+
+Use `PostNotif` only from in-process plugins. Out-of-process plugins already have a dedicated writer goroutine and should emit notifications via `plugsdk.Client` instead.
+
 ## Reference
 
 - Host internals: `plugin/host.go`, `plugin/extproc.go`
@@ -308,3 +429,4 @@ The bundled [`gofmt` example](../examples/plugins/gofmt/main.go) currently calls
 - SDK: `sdk/plugsdk/plugsdk.go`
 - Plugin-author harness: `sdk/plugsdk/plugintest/plugintest.go`
 - Examples: `examples/plugins/{hello-world,gofmt}/`
+- First-party async plugin: `internal/plugins/autoupdate/`

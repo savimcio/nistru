@@ -1,4 +1,9 @@
-.PHONY: test test-short race cover lint fuzz e2e ci fmt clean examples-test
+.PHONY: test test-short race cover lint fuzz e2e ci fmt clean examples-test build
+
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
+build:
+	go build -ldflags "-X main.Version=$(VERSION)" -o bin/nistru ./cmd/nistru
 
 test:
 	go test ./...
@@ -45,3 +50,4 @@ fmt:
 
 clean:
 	rm -f coverage.out coverage.html
+	rm -rf bin
