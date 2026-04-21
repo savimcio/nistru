@@ -1,4 +1,4 @@
-package main
+package editor
 
 import (
 	"bytes"
@@ -14,7 +14,7 @@ import (
 	"github.com/kujtimiihoxha/vimtea"
 
 	"github.com/savimcio/nistru/plugin"
-	"github.com/savimcio/nistru/plugins/treepane"
+	"github.com/savimcio/nistru/internal/plugins/treepane"
 )
 
 // App-level key constants. Inlining these rather than splitting into keys.go
