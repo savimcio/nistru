@@ -13,8 +13,9 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kujtimiihoxha/vimtea"
 
-	"github.com/savimcio/nistru/plugin"
+	"github.com/savimcio/nistru/internal/plugins/autoupdate"
 	"github.com/savimcio/nistru/internal/plugins/treepane"
+	"github.com/savimcio/nistru/plugin"
 )
 
 // App-level key constants. Inlining these rather than splitting into keys.go
@@ -116,10 +117,30 @@ func NewModel(root string) (*Model, error) {
 	}
 	registry.RegisterInProc(tp)
 
+	registry.RegisterInProc(autoupdate.New())
+
+	return newModelWithRegistry(root, registry)
+}
+
+// newModelWithRegistry is the shared constructor used by NewModel and by
+// tests that need to inject a pre-populated registry (e.g. a replacement
+// autoupdate plugin with test seams). It starts the host, fires the
+// onStart-matching Initialize event (so in-proc plugins register their
+// palette commands, start background workers, etc.), then snapshots commands
+// and returns a Model ready for Init().
+//
+// Emit(Initialize) runs OnEvent synchronously for in-proc plugins on the
+// calling goroutine; side effects (commands/register, statusBar/set) flow
+// through PostNotif whose host-side bookkeeping runs before the inbound
+// channel send, so the subsequent host.Commands() snapshot already includes
+// anything a plugin registered during Initialize.
+func newModelWithRegistry(root string, registry *plugin.Registry) (*Model, error) {
 	host := plugin.NewHost(registry)
 	if err := host.Start(root); err != nil {
 		return nil, fmt.Errorf("start plugin host: %w", err)
 	}
+
+	host.Emit(plugin.Initialize{RootPath: root, Capabilities: nil})
 
 	m := &Model{
 		root:     root,

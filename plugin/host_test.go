@@ -145,6 +145,145 @@ func TestHost_PaneByName(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// HostAware / PostNotif exercises.
+
+// hostAwarePlugin is a minimal in-proc plugin that records the host passed to
+// SetHost. Declared locally to avoid leaking HostAware semantics into the
+// default test fixtures, which must stay ignorant of the optional interface.
+type hostAwarePlugin struct {
+	fakeInProcPlugin
+	mu  sync.Mutex
+	got *Host
+}
+
+func (p *hostAwarePlugin) SetHost(h *Host) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.got = h
+}
+
+func (p *hostAwarePlugin) host() *Host {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.got
+}
+
+func TestHostSetsHostAwareOnStart(t *testing.T) {
+	p := &hostAwarePlugin{
+		fakeInProcPlugin: fakeInProcPlugin{name: "aware", acts: []string{"onStart"}},
+	}
+	h := newHostWithPlugins(p)
+	if got := p.host(); got != h {
+		t.Fatalf("SetHost got %p, want host %p", got, h)
+	}
+}
+
+func TestPostNotifDeliversToInbound(t *testing.T) {
+	p := &fakeInProcPlugin{name: "myplugin", acts: []string{"onStart"}}
+	h := newHostWithPlugins(p)
+
+	type payload struct {
+		Level   string `json:"level"`
+		Message string `json:"message"`
+	}
+	want := payload{Level: "info", Message: "hello"}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- h.PostNotif("myplugin", "ui/notify", want)
+	}()
+
+	cmd := h.Recv()
+	msg := cmd().(PluginMsg)
+
+	if err := <-done; err != nil {
+		t.Fatalf("PostNotif: %v", err)
+	}
+	n, ok := msg.(PluginNotifMsg)
+	if !ok {
+		t.Fatalf("msg = %T, want PluginNotifMsg", msg)
+	}
+	if n.Plugin != "myplugin" || n.Method != "ui/notify" {
+		t.Fatalf("notif = %+v, want {myplugin ui/notify ...}", n)
+	}
+	var got payload
+	if err := json.Unmarshal(n.Params, &got); err != nil {
+		t.Fatalf("unmarshal params: %v", err)
+	}
+	if got != want {
+		t.Fatalf("params = %+v, want %+v", got, want)
+	}
+}
+
+func TestPostNotifCommandRegistration(t *testing.T) {
+	p := &fakeInProcPlugin{name: "cmds", acts: []string{"onStart"}}
+	h := newHostWithPlugins(p)
+
+	params := struct {
+		ID    string `json:"id"`
+		Title string `json:"title"`
+	}{ID: "cmds.do", Title: "Do a thing"}
+
+	if err := h.PostNotif("cmds", "commands/register", params); err != nil {
+		t.Fatalf("PostNotif: %v", err)
+	}
+
+	// Synchronous bookkeeping: the command must be visible immediately,
+	// without anyone having drained the inbound channel.
+	cmds := h.Commands()
+	ref, ok := cmds["cmds.do"]
+	if !ok {
+		t.Fatalf("Commands()[cmds.do] missing; have %+v", cmds)
+	}
+	if ref.Plugin != "cmds" || ref.Title != "Do a thing" {
+		t.Fatalf("CommandRef = %+v, want {cmds \"Do a thing\"}", ref)
+	}
+
+	// Drain the synthetic notif so the channel doesn't block future tests.
+	<-h.inbound
+}
+
+func TestPostNotifDropsOnFullInbound(t *testing.T) {
+	p := &fakeInProcPlugin{name: "flood", acts: []string{"onStart"}}
+	h := newHostWithPlugins(p)
+
+	// Fill the inbound channel to capacity via PostNotif itself. Each call
+	// runs handleInternal (a no-op for ui/notify) and then a non-blocking
+	// send; we expect every call up to inboundCap to succeed.
+	for i := range inboundCap {
+		if err := h.PostNotif("flood", "ui/notify", map[string]string{
+			"message": "fill",
+		}); err != nil {
+			t.Fatalf("PostNotif(#%d) unexpectedly failed: %v", i, err)
+		}
+	}
+
+	// Guard against a silently hung call by timing out the next PostNotif.
+	// The non-blocking send must return promptly with the "inbound full"
+	// sentinel error.
+	done := make(chan error, 1)
+	go func() {
+		done <- h.PostNotif("flood", "ui/notify", map[string]string{
+			"message": "overflow",
+		})
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatalf("PostNotif on full inbound returned nil, want error")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatalf("PostNotif blocked on full inbound; want non-blocking drop")
+	}
+
+	// Drain so the host can be shut down cleanly (the test doesn't care
+	// about the messages themselves).
+	for range inboundCap {
+		<-h.inbound
+	}
+}
+
+// -----------------------------------------------------------------------------
 // Out-of-proc host exercises.
 
 func TestHost_SpawnAndInitialize(t *testing.T) {

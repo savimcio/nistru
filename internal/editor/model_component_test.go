@@ -26,6 +26,16 @@ import (
 
 func newTestModel(t *testing.T, root string) *Model {
 	t.Helper()
+	// NewModel now emits Initialize at boot, which spins up the autoupdate
+	// plugin's background checker and pokes the real user config dir for
+	// persistent state. Neither belongs in component tests; disable via env.
+	// The DISABLE knob skips the checker goroutine while still registering
+	// palette commands (see autoupdate.handleInitialize), so any command-
+	// registry behavior exercised here still works.
+	t.Setenv("NISTRU_AUTOUPDATE_DISABLE", "1")
+	t.Setenv("NISTRU_AUTOUPDATE_REPO", "")
+	t.Setenv("NISTRU_AUTOUPDATE_CHANNEL", "")
+	t.Setenv("NISTRU_AUTOUPDATE_INTERVAL", "")
 	m, err := NewModel(root)
 	if err != nil {
 		t.Fatalf("NewModel(%q): %v", root, err)

@@ -99,6 +99,38 @@ The editor is modal. It opens in **Normal** mode (cursor navigation). Press `i`,
 
 Autosave is enabled by default. After any buffer change, a 250 ms idle debounce schedules a write; rapid typing produces exactly one write when typing stops. Writes are atomic (write to `<path>.tmp`, then rename over the original), so a killed process never leaves a half-written file. The right side of the status bar shows `● unsaved` while dirty and `✓ saved` for about a second after each flush. A size guard refuses to open files larger than 1 MiB, and binary files are refused if a NUL byte appears in the first 512 bytes.
 
+## Auto-update
+
+Nistru ships with a first-party `autoupdate` plugin that watches GitHub Releases for newer versions. It is enabled by default, runs quietly in the background, and never swaps the binary without explicit palette invocation.
+
+**What it does.** Once an hour, the plugin issues a single unauthenticated `GET` to `api.github.com/repos/savimcio/nistru/releases`. If a newer version is available, a status-bar segment announces it; palette commands let you install it, roll back, switch channels, or view release notes. No telemetry is collected and no data is sent outbound beyond the GitHub API request itself.
+
+**Channels.**
+
+| Channel | Tracks |
+|---|---|
+| `release` (default) | stable GitHub releases only |
+| `dev` | includes prereleases |
+
+Switch with the `autoupdate:switch-channel` palette command, or start on a specific channel via `NISTRU_AUTOUPDATE_CHANNEL=dev`.
+
+**Environment variables.**
+
+| Variable | Effect |
+|---|---|
+| `NISTRU_AUTOUPDATE_DISABLE=1` | disables the plugin entirely |
+| `NISTRU_AUTOUPDATE_INTERVAL=30m` | custom check interval (any Go `time.ParseDuration` value) |
+| `NISTRU_AUTOUPDATE_CHANNEL=release\|dev` | start on a specific channel |
+| `NISTRU_AUTOUPDATE_REPO=owner/repo` | override source repository (useful for forks) |
+
+**Installing an update.** Open the palette with `Ctrl+P` and run `autoupdate:install`. On Linux and macOS, the new binary is downloaded, its SHA-256 is verified against the release's `checksums.txt`, and it is atomically swapped in place (the previous binary is retained for the session as `nistru.prev`). Restart nistru (`Ctrl+Q`, then relaunch) to pick up the new version. On Windows, the plugin does **not** swap the binary; it prints the appropriate `go install` command and leaves installation to you.
+
+**Rolling back.** `Ctrl+P` → `autoupdate:rollback` restores the previous binary from `nistru.prev`. The rollback target is retained only for the current session, so restart nistru before relying on it.
+
+**Prerequisites for in-place installation.** The target release must publish artifacts for your `GOOS/GOARCH` alongside a `checksums.txt` file. If your copy of nistru was installed via `go install ...@latest` and no matching release artifact exists, the plugin falls back to notifying you with the correct `go install` command instead of attempting a swap.
+
+**Privacy.** One unauthenticated request per hour to GitHub's public Releases API. GitHub observes the requester's IP address (as it would for any HTTP client). No identifying information, crash data, or editor state is disclosed. To opt out entirely, set `NISTRU_AUTOUPDATE_DISABLE=1`.
+
 ## Plugins
 
 Nistru has a plugin system with two transports (in-process Go for panes, out-of-process JSON-RPC for everything else). The bundled file tree is itself a plugin. See **[docs/plugins.md](docs/plugins.md)** for the architecture, manifest schema, SDK, and worked examples.

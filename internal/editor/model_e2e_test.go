@@ -156,11 +156,30 @@ func assertGolden(t *testing.T, name string, got []byte) {
 // in the status bar — absolute paths would leak the tempdir name into the
 // golden).
 
+// disableAutoupdate sets the full set of autoupdate env overrides so the
+// plugin is fully hermetic: background checker off, no ambient repo/channel/
+// interval leaking in from the developer shell. Every e2e test that goes
+// through NewModel calls this so Initialize-at-boot doesn't introduce
+// network-flakiness or golden drift.
+func disableAutoupdate(t *testing.T) {
+	t.Helper()
+	t.Setenv("NISTRU_AUTOUPDATE_DISABLE", "1")
+	t.Setenv("NISTRU_AUTOUPDATE_REPO", "")
+	t.Setenv("NISTRU_AUTOUPDATE_CHANNEL", "")
+	t.Setenv("NISTRU_AUTOUPDATE_INTERVAL", "")
+}
+
 // newRenderedModel constructs a Model at (w,h), applies setup, and returns the
 // rendered View(). The root argument controls which workspace the tree pane
 // is rooted at.
 func newRenderedModel(t *testing.T, root string, w, h int, setup func(*Model)) string {
 	t.Helper()
+	// Disable the autoupdate background checker for every golden-capturing
+	// test. NewModel fires Initialize at boot, which would otherwise spin up
+	// a goroutine that hits api.github.com and (on first response) writes a
+	// green "v…" segment into the status bar — the resulting non-determinism
+	// drifts every goldens in this file.
+	disableAutoupdate(t)
 	m, err := NewModel(root)
 	if err != nil {
 		t.Fatalf("NewModel(%q): %v", root, err)
@@ -371,6 +390,7 @@ func TestE2E_EditAutosaveToDisk(t *testing.T) {
 	// real tea.Program. Uses Ctrl+S (force save) rather than waiting out the
 	// 250 ms autosave debounce so the test stays inside the <200 ms budget.
 	// A separate -short-skipping test below covers the true debounce path.
+	disableAutoupdate(t)
 	dir := t.TempDir()
 	path := writeFile(t, dir, "note.txt", "seed\n")
 	m, err := NewModel(dir)
@@ -433,6 +453,7 @@ func TestE2E_EditAutosaveToDisk(t *testing.T) {
 func TestE2E_PaletteRegisteredCommandExecutes(t *testing.T) {
 	// Register an in-proc test plugin that captures ExecuteCommand events.
 	// We construct the Host ourselves so we can inject the test plugin.
+	disableAutoupdate(t)
 	root := emptyRoot(t)
 	m, err := NewModel(root)
 	if err != nil {
@@ -468,6 +489,7 @@ func TestE2E_CtrlCInInsertModeStaysAsCopyAndReturnsToNormal(t *testing.T) {
 	// synthVimMotion, which prepends SetMode(ModeNormal). We drive that flow
 	// through a real tea.Program to confirm the buffer isn't quit and the
 	// editor ends in Normal mode.
+	disableAutoupdate(t)
 	dir := t.TempDir()
 	path := writeFile(t, dir, "z.txt", "line1\nline2\n")
 	m, err := NewModel(dir)
@@ -517,6 +539,7 @@ func TestE2E_CtrlQWithDirtyBufferFlushesBeforeExit(t *testing.T) {
 	if testing.Short() {
 		t.Skip("flush-on-quit is synchronous but setup drives real tea.Program; skipped under -short")
 	}
+	disableAutoupdate(t)
 	dir := t.TempDir()
 	path := writeFile(t, dir, "q.txt", "seed\n")
 	m, err := NewModel(dir)

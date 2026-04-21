@@ -140,6 +140,10 @@ func NewHost(registry *Registry) *Host {
 // Start records the workspace root and readies the host. Out-of-process
 // plugins are not spawned here; they come online lazily on their first
 // matching activation event.
+//
+// In-process plugins that satisfy HostAware receive a SetHost call before
+// this method returns, giving them a handle they can use from background
+// goroutines (via PostNotif) once Initialize is delivered.
 func (h *Host) Start(rootPath string) error {
 	h.mu.Lock()
 	if h.started {
@@ -149,7 +153,47 @@ func (h *Host) Start(rootPath string) error {
 	h.rootPath = rootPath
 	h.started = true
 	h.mu.Unlock()
+
+	// Wire HostAware plugins outside h.mu: SetHost is user code and may do
+	// arbitrary work; holding the host lock would invite deadlocks if an
+	// implementation reaches back into the host during its own setup.
+	for _, p := range h.registry.InProc() {
+		if hp, ok := p.(HostAware); ok {
+			hp.SetHost(h)
+		}
+	}
 	return nil
+}
+
+// PostNotif enqueues a synthetic JSON-RPC notification on the host's
+// inbound channel, as if it had arrived from an out-of-process plugin.
+// Safe to call from any goroutine. Non-blocking: if the inbound channel
+// is full, the notification is dropped and a warning is written to
+// stderr. This is primarily for in-process plugins that need to report
+// status from background work; out-of-process plugins already have a
+// dedicated writer goroutine and should not call this method.
+//
+// Host-side bookkeeping (e.g. commands/register) is applied synchronously
+// before the channel send, so callers see command registration as
+// effective on return even if the inbound buffer is saturated.
+func (h *Host) PostNotif(plugin, method string, params any) error {
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return fmt.Errorf("plugin: PostNotif marshal %s: %w", method, err)
+	}
+	msg := PluginNotifMsg{Plugin: plugin, Method: method, Params: raw}
+	// Drive host-side bookkeeping (e.g. commands/register) synchronously
+	// so callers see command registration as effective on return.
+	// handleInternal is idempotent: registerCommand/unregisterCommand are
+	// CAS loops against the commands atomic.Value.
+	h.handleInternal(msg)
+	select {
+	case h.inbound <- msg:
+		return nil
+	default:
+		fmt.Fprintf(os.Stderr, "plugin: PostNotif(%s:%s) dropped: inbound full\n", plugin, method)
+		return errors.New("plugin: inbound channel full")
+	}
 }
 
 // Emit delivers event to every plugin whose activation matches. For in-proc
