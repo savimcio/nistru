@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: ['1.26.x']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Run CI
+        run: make ci
+
+      - name: Test example plugins
+        run: |
+          for mod in examples/plugins/*/; do
+            echo ">>> go test in $mod"
+            (cd "$mod" && go test -race -count=1 ./...)
+          done
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
+
+      - name: Write coverage to step summary
+        run: go tool cover -func=coverage.out | tail -1 >> $GITHUB_STEP_SUMMARY

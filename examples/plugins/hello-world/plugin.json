@@ -1,0 +1,7 @@
+{
+  "name": "hello-world",
+  "version": "0.1.0",
+  "cmd": ["./hello-world"],
+  "activation": ["onStart"],
+  "capabilities": ["commands"]
+}

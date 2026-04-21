@@ -1,0 +1,9 @@
+.claude/plans/
+/nistru
+/examples/plugins/hello-world/hello-world
+/examples/plugins/gofmt/gofmt-plugin
+*.swp
+.DS_Store
+coverage.out
+coverage.html
+*.prof

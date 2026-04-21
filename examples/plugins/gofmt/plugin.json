@@ -1,0 +1,7 @@
+{
+  "name": "gofmt",
+  "version": "0.1.0",
+  "cmd": ["./gofmt-plugin"],
+  "activation": ["onLanguage:go"],
+  "capabilities": ["formatter", "commands"]
+}

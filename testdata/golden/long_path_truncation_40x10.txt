@@ -1,0 +1,13 @@
+▾ 001/                        │   1
+└── ▸ aaaaaaaa/               │package
+                              │deep
+                              │   1
+                              │
+                              │
+                              │
+                              │
+                              │
+
+                                NORMAL
+                               1:1
+[NORMAL] …ccc/dddddddd/eeeeeeee/file.go

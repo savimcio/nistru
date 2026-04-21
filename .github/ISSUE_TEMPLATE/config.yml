@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security reports
+    url: https://github.com/savimcio/nistru/security/advisories/new
+    about: Please report security issues privately via GitHub's security advisories — not the public issue tracker.
+  - name: Testing strategy
+    url: https://github.com/savimcio/nistru/blob/master/docs/testing.md
+    about: Before opening a test-related issue, skim the tier rubric — your case may already have a home.
+  - name: Writing a plugin
+    url: https://github.com/savimcio/nistru/blob/master/docs/plugins.md
+    about: Plugin architecture, manifest schema, SDK, and a 30-line test-harness example.

@@ -1,0 +1,81 @@
+name: Bug report
+description: Something broke or misbehaved.
+title: "bug: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Please fill every required field — the four environment questions unblock most triage.
+
+  - type: input
+    id: commit
+    attributes:
+      label: Nistru commit or tag
+      description: Output of `git describe --always` in your checkout, or the release tag you installed.
+      placeholder: e.g. v0.1.1, or 776985f
+    validations:
+      required: true
+
+  - type: input
+    id: go_version
+    attributes:
+      label: Go version
+      description: Output of `go version`.
+      placeholder: go version go1.26.2 darwin/arm64
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: terminal
+    attributes:
+      label: Terminal
+      description: iTerm2, Kitty, Alacritty, GNOME Terminal, Windows Terminal, tmux inside X, etc.
+      placeholder: iTerm2 3.5 on macOS
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Minimal, exact steps. Keystrokes welcome.
+      placeholder: |
+        1. `./nistru -path some/dir`
+        2. Press `Ctrl+P`, type "gof", Enter
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: Include screenshots or an asciinema cast if you have them.
+    validations:
+      required: true
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Extra context
+      description: Logs, stack traces, plugin manifests, anything else that helps.
