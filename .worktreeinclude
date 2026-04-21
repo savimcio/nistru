@@ -1,0 +1,58 @@
+# .worktreeinclude
+#
+# gitignore-style manifest of locally-ignored files that `claude --worktree`
+# copies into a new worktree. Claude only copies a path when it matches a
+# pattern here AND is gitignored, so tracked source is never duplicated
+# and this file can never stomp the worktree's clean checkout.
+#
+# Docs: https://code.claude.com/docs/en/common-workflows#copy-gitignored-files-to-worktrees
+# Scope: read from the project root only — no home-directory equivalent.
+
+# --- Claude Code project state --------------------------------------------
+#
+# Without the permission allowlist the worktree re-prompts for commands the
+# main repo already trusts, which defeats the point of branching off an
+# agent session mid-task.
+.claude/settings.local.json
+
+# In-flight and archived plans from the CLAUDE.md plan protocol. Required
+# for the "resume from first unchecked task" behaviour to work across
+# worktrees. Drop this block if you deliberately want every worktree to
+# start with a blank planning slate.
+.claude/plans/**
+
+# --- Dev-environment config (uncomment when relevant) ---------------------
+#
+# This project has no .env today. If one ever appears, uncomment the
+# block — the worktree lives on the same trust boundary as the main
+# checkout so this does not widen the secret exposure, it just means
+# one more on-disk copy. Still gated by .gitignore so nothing propagates
+# into git history.
+#.env
+#.env.local
+#.env.*.local
+#.envrc
+#
+# Editor workspace state not worth committing (VS Code launch configs,
+# JetBrains run configurations, etc.).
+#.vscode/settings.json
+#.vscode/launch.json
+#.idea/workspace.xml
+#
+# Local tool pins.
+#.tool-versions
+#.nvmrc
+#.go-version
+
+# --- Intentionally NOT carried over ---------------------------------------
+#
+# bin/, coverage.out, coverage.html, *.prof, examples/*/<plugin-binary>
+#     Build/test artifacts — let the worktree regenerate them so stale
+#     caches don't silently influence a `go build` or `make ci` run.
+#
+# .worktrees/**
+#     Sibling Claude worktrees. Copying this would recursively drag
+#     other branches' state into this one; disaster.
+#
+# *.swp, .DS_Store
+#     Transient editor/OS droppings.
