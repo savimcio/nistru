@@ -4,13 +4,18 @@ import (
 	"fmt"
 
 	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/savimcio/nistru/internal/config"
 )
 
 // Run starts the editor's Bubble Tea program rooted at path and
 // guarantees a final autosave flush on exit. It is the single entry
 // point consumed by cmd/nistru.
-func Run(path string) error {
-	m, err := NewModel(path)
+//
+// A nil cfg is replaced with config.Defaults() so callers that haven't
+// wired in the loader yet still get a working editor.
+func Run(path string, cfg *config.Config) error {
+	m, err := NewModel(path, cfg)
 	if err != nil {
 		return err
 	}

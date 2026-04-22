@@ -3,7 +3,18 @@ package editor
 import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/kujtimiihoxha/vimtea"
+
+	"github.com/savimcio/nistru/internal/config"
 )
+
+// editorOpts bundles the config-driven knobs newEditor consumes. A nil
+// pointer means "use defaults" — which keeps hand-constructed test Models
+// calling newEditor("", "") without a config handy. The fields default to
+// the built-in keymap and enabled relative numbers when zero-valued.
+type editorOpts struct {
+	Keymap          config.Keymap
+	RelativeNumbers bool
+}
 
 // newEditor constructs a fresh vimtea.Editor and registers the micro-style
 // Ctrl bindings that live inside the editor (Ctrl+Z/Y/X/C/V for undo, redo,
@@ -11,24 +22,51 @@ import (
 // level — they are app-wide concerns, not editor concerns — so they are NOT
 // registered here.
 //
+// opts (variadic, at most one) supplies the user's keymap and whether the
+// editor renders relative line numbers. Passing no opts is equivalent to
+// passing a nil pointer: defaults apply. Production callers pass the
+// resolved config's fields; hand-constructed Models in tests omit it.
+//
 // This factory is called from two places:
 //  1. main.go / initial model construction, with empty content.
 //  2. model.go, when a file is opened from the tree (fresh Editor per open).
 //
 // Because the editor is reconstructed on each open, the bindings below are
 // re-registered every time — a fresh Editor has no user bindings.
-func newEditor(content, path string) vimtea.Editor {
-	opts := []vimtea.EditorOption{
+func newEditor(content, path string, opts ...*editorOpts) vimtea.Editor {
+	var o *editorOpts
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	km, relNums := resolveEditorOpts(o)
+
+	vopts := []vimtea.EditorOption{
 		vimtea.WithContent(content),
-		vimtea.WithRelativeNumbers(true),
+		vimtea.WithRelativeNumbers(relNums),
 	}
 	if path != "" {
-		opts = append(opts, vimtea.WithFileName(path))
+		vopts = append(vopts, vimtea.WithFileName(path))
 	}
-	e := vimtea.NewEditor(opts...)
+	e := vimtea.NewEditor(vopts...)
 
-	addCtrlBindings(e)
+	addCtrlBindings(e, km)
 	return e
+}
+
+// resolveEditorOpts returns the effective keymap + relative-numbers setting
+// for a (possibly nil) editorOpts pointer. Split out so both newEditor and
+// direct callers in tests can compute the same defaults without duplicating
+// the condition logic.
+func resolveEditorOpts(o *editorOpts) (config.Keymap, bool) {
+	if o == nil {
+		d := config.Defaults()
+		return d.Keymap, d.UI.RelativeNumbers
+	}
+	km := o.Keymap
+	if km == nil {
+		km = config.DefaultKeymap()
+	}
+	return km, o.RelativeNumbers
 }
 
 // addCtrlBindings registers micro-style Ctrl shortcuts inside the editor.
@@ -54,12 +92,22 @@ func newEditor(content, path string) vimtea.Editor {
 // Buffer does not expose direct DeleteLine/YankLine/Paste primitives, so the
 // tea.Sequence-through-the-key-path remains the only way to reach vimtea's
 // motion engine from a binding handler.
-func addCtrlBindings(e vimtea.Editor) {
+//
+// Keys are resolved via km.Lookup(action) so a user can rebind any of them
+// through the config's [keymap] table. A nil or incomplete Keymap falls back
+// to the built-in defaults (see config.Keymap.Lookup).
+func addCtrlBindings(e vimtea.Editor, km config.Keymap) {
 	modes := []vimtea.EditorMode{vimtea.ModeNormal, vimtea.ModeInsert, vimtea.ModeVisual}
+
+	undoKey := km.Lookup(config.ActionUndo)
+	redoKey := km.Lookup(config.ActionRedo)
+	cutKey := km.Lookup(config.ActionCutLine)
+	copyKey := km.Lookup(config.ActionCopyLine)
+	pasteKey := km.Lookup(config.ActionPaste)
 
 	for _, mode := range modes {
 		e.AddBinding(vimtea.KeyBinding{
-			Key:         "ctrl+z",
+			Key:         undoKey,
 			Mode:        mode,
 			Description: "undo",
 			Handler: func(buf vimtea.Buffer) tea.Cmd {
@@ -68,7 +116,7 @@ func addCtrlBindings(e vimtea.Editor) {
 		})
 
 		e.AddBinding(vimtea.KeyBinding{
-			Key:         "ctrl+y",
+			Key:         redoKey,
 			Mode:        mode,
 			Description: "redo",
 			Handler: func(buf vimtea.Buffer) tea.Cmd {
@@ -77,7 +125,7 @@ func addCtrlBindings(e vimtea.Editor) {
 		})
 
 		e.AddBinding(vimtea.KeyBinding{
-			Key:         "ctrl+x",
+			Key:         cutKey,
 			Mode:        mode,
 			Description: "cut line",
 			Handler: func(buf vimtea.Buffer) tea.Cmd {
@@ -86,7 +134,7 @@ func addCtrlBindings(e vimtea.Editor) {
 		})
 
 		e.AddBinding(vimtea.KeyBinding{
-			Key:         "ctrl+c",
+			Key:         copyKey,
 			Mode:        mode,
 			Description: "copy line",
 			Handler: func(buf vimtea.Buffer) tea.Cmd {
@@ -95,7 +143,7 @@ func addCtrlBindings(e vimtea.Editor) {
 		})
 
 		e.AddBinding(vimtea.KeyBinding{
-			Key:         "ctrl+v",
+			Key:         pasteKey,
 			Mode:        mode,
 			Description: "paste",
 			Handler: func(buf vimtea.Buffer) tea.Cmd {

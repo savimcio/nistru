@@ -5,11 +5,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/savimcio/nistru/internal/config"
+	"github.com/savimcio/nistru/internal/plugins/settingscmd"
+	"github.com/savimcio/nistru/internal/plugins/treepane"
 	"github.com/savimcio/nistru/plugin"
 )
 
@@ -36,7 +40,7 @@ func newTestModel(t *testing.T, root string) *Model {
 	t.Setenv("NISTRU_AUTOUPDATE_REPO", "")
 	t.Setenv("NISTRU_AUTOUPDATE_CHANNEL", "")
 	t.Setenv("NISTRU_AUTOUPDATE_INTERVAL", "")
-	m, err := NewModel(root)
+	m, err := NewModel(root, nil)
 	if err != nil {
 		t.Fatalf("NewModel(%q): %v", root, err)
 	}
@@ -680,3 +684,422 @@ func TestModel_PluginMessagePlumbing(t *testing.T) {
 type errSentinel struct{}
 
 func (errSentinel) Error() string { return "crashed: simulated" }
+
+// -----------------------------------------------------------------------------
+// T4 config-threading regression tests. These lock in the behaviour that
+// Model's config knobs (keymap, tree width, per-plugin config) flow through
+// the constructor path into the runtime, rather than being hardcoded.
+
+// TestModel_CustomKeymap_SavesOnConfiguredKey asserts that rebinding
+// ActionSave in the keymap reroutes the save handler accordingly. We bind
+// Save to F5 (a chord that tea.KeyMsg natively round-trips through
+// .String()), feed a KeyF5 KeyMsg, and verify flushNow ran — via the
+// nowFunc-stubbed lastSavedAt and the file landing on disk.
+//
+// F5 is chosen because more exotic chords like ctrl+shift+s require escape
+// sequences tea.KeyMsg doesn't let us synthesize directly, and the point
+// of this test is the routing, not the chord encoding.
+func TestModel_CustomKeymap_SavesOnConfiguredKey(t *testing.T) {
+	stubTime := time.Date(2099, 1, 2, 3, 4, 5, 0, time.UTC)
+	prev := nowFunc
+	nowFunc = func() time.Time { return stubTime }
+	t.Cleanup(func() { nowFunc = prev })
+
+	dir := t.TempDir()
+	path := writeFile(t, dir, "a.txt", "seed\n")
+
+	// NewModel still registers treepane + autoupdate, but we only care about
+	// the top-level Model config plumbing here. Disable autoupdate's network.
+	t.Setenv("NISTRU_AUTOUPDATE_DISABLE", "1")
+	t.Setenv("NISTRU_AUTOUPDATE_REPO", "")
+	t.Setenv("NISTRU_AUTOUPDATE_CHANNEL", "")
+	t.Setenv("NISTRU_AUTOUPDATE_INTERVAL", "")
+
+	cfg := config.Defaults()
+	cfg.Keymap[config.ActionSave] = "f5"
+	m, err := NewModel(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
+	t.Cleanup(func() { _ = m.host.Shutdown(100 * time.Millisecond) })
+
+	// Open the file and dirty its buffer so flushNow has something to write.
+	newM, _ := m.Update(openFileRequestMsg{path: path})
+	m = newM.(*Model)
+	m.editor.GetBuffer().InsertAt(0, 0, "X")
+	m.dirty = true
+
+	beforeSaved := m.lastSavedAt
+
+	newM, cmd := m.Update(tea.KeyMsg{Type: tea.KeyF5})
+	m = newM.(*Model)
+
+	// If the config-driven binding worked, flushNow ran and lastSavedAt is
+	// the stubbed time. If the binding were still hardcoded to ctrl+s, the
+	// F5 keypress would have fallen through to forwardToFocused — leaving
+	// lastSavedAt unchanged.
+	if m.lastSavedAt.Equal(beforeSaved) {
+		t.Errorf("lastSavedAt did not change; F5 did not trigger configured Save binding")
+	}
+	if !m.lastSavedAt.Equal(stubTime) {
+		t.Errorf("lastSavedAt: got %v, want %v (stubbed)", m.lastSavedAt, stubTime)
+	}
+	if m.dirty {
+		t.Errorf("dirty should be false after save")
+	}
+	if cmd == nil {
+		t.Errorf("handleKey Save path should emit the 'saved' status cmd")
+	}
+	// Assert the file on disk matches the buffer.
+	gotOnDisk, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("readback: %v", err)
+	}
+	if string(gotOnDisk) != m.editor.GetBuffer().Text() {
+		t.Errorf("disk mismatch: got %q, want %q", gotOnDisk, m.editor.GetBuffer().Text())
+	}
+}
+
+// TestModel_CustomTreeWidth_AppliesToLayout asserts that m.cfg.UI.TreeWidth
+// flows into OnResize bookkeeping on a WindowSizeMsg. With a custom width
+// of 42, m.lastPaneW should land at 42 after the first tick.
+func TestModel_CustomTreeWidth_AppliesToLayout(t *testing.T) {
+	t.Setenv("NISTRU_AUTOUPDATE_DISABLE", "1")
+	t.Setenv("NISTRU_AUTOUPDATE_REPO", "")
+	t.Setenv("NISTRU_AUTOUPDATE_CHANNEL", "")
+	t.Setenv("NISTRU_AUTOUPDATE_INTERVAL", "")
+
+	cfg := config.Defaults()
+	cfg.UI.TreeWidth = 42
+
+	dir := t.TempDir()
+	m, err := NewModel(dir, cfg)
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
+	t.Cleanup(func() { _ = m.host.Shutdown(100 * time.Millisecond) })
+
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	got := newM.(*Model)
+
+	if got.lastPaneW != 42 {
+		t.Errorf("lastPaneW after WindowSize: got %d, want 42 (cfg.UI.TreeWidth)", got.lastPaneW)
+	}
+	if got.treeWidth() != 42 {
+		t.Errorf("treeWidth helper: got %d, want 42", got.treeWidth())
+	}
+}
+
+// TestModel_PluginConfig_FlowsToHost wires a stub in-proc ConfigReceiver
+// into a fresh Registry and asserts that the sub-tree returned by
+// cfg.PluginConfig(name) arrives at the plugin's OnConfig on construction.
+func TestModel_PluginConfig_FlowsToHost(t *testing.T) {
+	root := t.TempDir()
+
+	// Build a Config whose PluginConfig method returns our desired raw bytes
+	// for the stub's name. We bypass the file/env pipeline and inject the
+	// bytes via EnvOverlay: PluginConfig merges file + env and serialises the
+	// result, so env-only populates raw-bytes to a JSON object.
+	cfg := config.Defaults()
+	cfg.Plugins.EnvOverlay = map[string]map[string]any{
+		"stubcfg": {"x": float64(7)},
+	}
+
+	// Build the registry with treepane (for leftPane wiring) + our stub.
+	registry := plugin.NewRegistry()
+	tp, err := treepane.New(root)
+	if err != nil {
+		t.Fatalf("treepane.New: %v", err)
+	}
+	registry.RegisterInProc(tp)
+
+	stub := &stubConfigReceiver{name: "stubcfg"}
+	registry.RegisterInProc(stub)
+
+	m, err := newModelWithRegistry(root, registry, cfg)
+	if err != nil {
+		t.Fatalf("newModelWithRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = m.host.Shutdown(100 * time.Millisecond) })
+
+	got := stub.last()
+	if got == nil {
+		t.Fatalf("stub plugin never received OnConfig")
+	}
+	// PluginConfig marshals the merged map, so we expect {"x":7} (JSON
+	// number encoding for float64 7).
+	var parsed map[string]any
+	if err := json.Unmarshal(got, &parsed); err != nil {
+		t.Fatalf("received config not valid JSON: %v (raw=%s)", err, got)
+	}
+	if x, ok := parsed["x"].(float64); !ok || x != 7 {
+		t.Errorf("received config: got %v, want {x:7}", parsed)
+	}
+}
+
+// stubConfigReceiver is a minimal in-proc plugin implementing both the
+// Plugin and ConfigReceiver interfaces; used to observe OnConfig dispatch
+// end-to-end from Host.Emit(Initialize{...}) in newModelWithRegistry.
+type stubConfigReceiver struct {
+	name string
+	mu   sync.Mutex
+	got  json.RawMessage
+}
+
+func (s *stubConfigReceiver) Name() string             { return s.name }
+func (s *stubConfigReceiver) Activation() []string     { return []string{"onStart"} }
+func (s *stubConfigReceiver) OnEvent(any) []plugin.Effect { return nil }
+func (s *stubConfigReceiver) Shutdown() error          { return nil }
+
+func (s *stubConfigReceiver) OnConfig(raw json.RawMessage) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cp := make(json.RawMessage, len(raw))
+	copy(cp, raw)
+	s.got = cp
+	return nil
+}
+
+func (s *stubConfigReceiver) last() json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.got
+}
+
+// TestModel_ReloadPalette_UpdatesPluginConfig exercises the end-to-end
+// reload flow: settingscmd.reload fires plugin.ReloadConfigRequest, which
+// the Model intercepts and translates into config.Load + SetPluginConfig +
+// ReEmitInitialize. A stub ConfigReceiver observes OnConfig before and
+// after, verifying the swap lands at the plugin level.
+//
+// XDG_CONFIG_HOME redirects UserPath() to tempDir so the real user config
+// tree is never touched. The user config is the only file we mutate —
+// project config stays untouched.
+func TestModel_ReloadPalette_UpdatesPluginConfig(t *testing.T) {
+	t.Setenv("NISTRU_AUTOUPDATE_DISABLE", "1")
+	t.Setenv("NISTRU_AUTOUPDATE_REPO", "")
+	t.Setenv("NISTRU_AUTOUPDATE_CHANNEL", "")
+	t.Setenv("NISTRU_AUTOUPDATE_INTERVAL", "")
+
+	userDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", userDir)
+	t.Setenv("HOME", userDir)
+
+	userCfgPath, err := config.UserPath()
+	if err != nil {
+		t.Fatalf("UserPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(userCfgPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	write := func(contents string) {
+		if err := os.WriteFile(userCfgPath, []byte(contents), 0o644); err != nil {
+			t.Fatalf("write user cfg: %v", err)
+		}
+	}
+	write("[plugins.stub]\nk = 1\n")
+
+	// Build a minimal registry manually: treepane for leftPane sugar, the
+	// stub to observe OnConfig, and settingscmd so the reload command is
+	// actually registered in host.Commands().
+	registry := plugin.NewRegistry()
+	tp, err := treepane.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("treepane.New: %v", err)
+	}
+	registry.RegisterInProc(tp)
+
+	stub := &stubConfigReceiver{name: "stub"}
+	registry.RegisterInProc(stub)
+
+	// NOTE: settingscmd is *not* registered through newModelWithRegistry.
+	// We build our own plugin instance whose getCfg closure returns the
+	// Model's cfg lazily, mirroring what NewModel does in production.
+	root := t.TempDir()
+	var mref *Model
+	getCfg := func() *config.Config {
+		if mref == nil {
+			return nil
+		}
+		return mref.cfg
+	}
+	registry.RegisterInProc(settingscmd.New(root, getCfg))
+
+	// Load through the real pipeline so Plugins.Raw/MD are populated the
+	// same way cmd/nistru does.
+	cfg, _, err := config.Load(root)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	m, err := newModelWithRegistry(root, registry, cfg)
+	if err != nil {
+		t.Fatalf("newModelWithRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = m.host.Shutdown(100 * time.Millisecond) })
+	mref = m
+
+	gotBefore := stub.last()
+	if gotBefore == nil {
+		t.Fatalf("stub never received OnConfig on Initialize")
+	}
+	var before map[string]any
+	if err := json.Unmarshal(gotBefore, &before); err != nil {
+		t.Fatalf("unmarshal before: %v", err)
+	}
+	if got, _ := before["k"].(int64); got == 1 {
+		// BurntSushi TOML decodes TOML integers as int64 through
+		// json.RawMessage+map[string]any — but that route goes through
+		// json.Unmarshal and yields float64. Either way we just assert
+		// the pre-state matches k=1 via the numeric-equality helper.
+	}
+	if !numericEq(before["k"], 1) {
+		t.Fatalf("pre-reload stub config = %v, want k=1", before)
+	}
+
+	// Mutate the user config on disk.
+	write("[plugins.stub]\nk = 2\n")
+
+	// Dispatch the reload command through the host exactly like the palette
+	// does. ExecuteCommand returns a Sync result because settingscmd is an
+	// in-proc plugin; apply the effects through m.applyEffects to mirror
+	// handlePaletteKey.
+	result := m.host.ExecuteCommand("nistru.settings.reload", nil)
+	if result.Sync == nil {
+		t.Fatalf("reload command returned no Sync result: %+v", result)
+	}
+	if result.Sync.Err != nil {
+		t.Fatalf("reload command error: %v", result.Sync.Err)
+	}
+	// applyEffects drives reloadConfig for us (it handles the
+	// ReloadConfigRequest case). We discard the returned cmd — it carries
+	// the "settings reloaded" status-bar message, which is not under test.
+	_ = m.applyEffects(result.Sync.Effects)
+
+	gotAfter := stub.last()
+	if gotAfter == nil {
+		t.Fatalf("stub received no OnConfig after reload")
+	}
+	var after map[string]any
+	if err := json.Unmarshal(gotAfter, &after); err != nil {
+		t.Fatalf("unmarshal after: %v", err)
+	}
+	if !numericEq(after["k"], 2) {
+		t.Fatalf("post-reload stub config = %v, want k=2", after)
+	}
+}
+
+// TestModel_ReloadPalette_RelativeNumbersTakesEffect verifies that changing
+// [ui].relative_numbers on disk and firing the reload command actually
+// rebuilds the underlying vimtea.Editor so the new setting is in effect
+// immediately — without waiting for the user to open another file. vimtea
+// doesn't expose the flag on its Editor interface, so the assertion is
+// indirect: we take a before/after snapshot of m.editor's pointer identity
+// and confirm it changed, plus verify m.cfg.UI.RelativeNumbers took the new
+// value. Together, those two checks cover the observable contract — "the
+// editor instance that renders is the one that booted with the new setting".
+func TestModel_ReloadPalette_RelativeNumbersTakesEffect(t *testing.T) {
+	t.Setenv("NISTRU_AUTOUPDATE_DISABLE", "1")
+	t.Setenv("NISTRU_AUTOUPDATE_REPO", "")
+	t.Setenv("NISTRU_AUTOUPDATE_CHANNEL", "")
+	t.Setenv("NISTRU_AUTOUPDATE_INTERVAL", "")
+
+	userDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", userDir)
+	t.Setenv("HOME", userDir)
+
+	userCfgPath, err := config.UserPath()
+	if err != nil {
+		t.Fatalf("UserPath: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(userCfgPath), 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	write := func(contents string) {
+		if err := os.WriteFile(userCfgPath, []byte(contents), 0o644); err != nil {
+			t.Fatalf("write user cfg: %v", err)
+		}
+	}
+	// Start with relative_numbers = true (the default) declared explicitly so
+	// the before-state is unambiguous.
+	write("[ui]\nrelative_numbers = true\n")
+
+	registry := plugin.NewRegistry()
+	tp, err := treepane.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("treepane.New: %v", err)
+	}
+	registry.RegisterInProc(tp)
+
+	root := t.TempDir()
+	var mref *Model
+	getCfg := func() *config.Config {
+		if mref == nil {
+			return nil
+		}
+		return mref.cfg
+	}
+	registry.RegisterInProc(settingscmd.New(root, getCfg))
+
+	cfg, _, err := config.Load(root)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	if !cfg.UI.RelativeNumbers {
+		t.Fatalf("pre-reload cfg.UI.RelativeNumbers = false, want true")
+	}
+	m, err := newModelWithRegistry(root, registry, cfg)
+	if err != nil {
+		t.Fatalf("newModelWithRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = m.host.Shutdown(100 * time.Millisecond) })
+	mref = m
+
+	edBefore := m.editor
+
+	// Flip the setting on disk.
+	write("[ui]\nrelative_numbers = false\n")
+
+	result := m.host.ExecuteCommand("nistru.settings.reload", nil)
+	if result.Sync == nil || result.Sync.Err != nil {
+		t.Fatalf("reload command: sync=%+v err=%v", result.Sync, result.Sync != nil && result.Sync.Err != nil)
+	}
+	_ = m.applyEffects(result.Sync.Effects)
+
+	if m.cfg.UI.RelativeNumbers {
+		t.Fatalf("post-reload cfg.UI.RelativeNumbers = true, want false")
+	}
+	if m.editor == edBefore {
+		t.Fatalf("m.editor pointer unchanged after relative_numbers reload; editor still has stale flag")
+	}
+
+	// Inverse case: a reload that changes nothing relevant should NOT
+	// reconstruct the editor — otherwise a routine reload would blow away
+	// cursor position unnecessarily.
+	edAfterFirst := m.editor
+	// No-op change: still relative_numbers=false, just with a comment added.
+	write("[ui]\nrelative_numbers = false\n# no-op change\n")
+	result = m.host.ExecuteCommand("nistru.settings.reload", nil)
+	if result.Sync == nil || result.Sync.Err != nil {
+		t.Fatalf("second reload: sync=%+v", result.Sync)
+	}
+	_ = m.applyEffects(result.Sync.Effects)
+	if m.editor != edAfterFirst {
+		t.Fatalf("m.editor rebuilt on no-op reload; editor should only rebuild when a baked-in knob changed")
+	}
+}
+
+// numericEq reports whether v equals want, accepting any of the numeric
+// types json.Unmarshal (float64) or BurntSushi's primitive decode (int64)
+// might produce for a TOML integer. Keeps the reload test agnostic to the
+// decode path.
+func numericEq(v any, want int) bool {
+	switch x := v.(type) {
+	case float64:
+		return x == float64(want)
+	case int64:
+		return x == int64(want)
+	case int:
+		return x == want
+	}
+	return false
+}

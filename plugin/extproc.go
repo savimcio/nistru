@@ -184,15 +184,7 @@ func (h *Host) spawn(m *Manifest) error {
 	initID := h.nextID()
 	respCh := make(chan *Response, 1)
 	ext.pending.Store(normalizeID(initID), respCh)
-	ext.enqueue(outFrame{
-		isNotif: false,
-		method:  "initialize",
-		id:      initID,
-		params: Initialize{
-			RootPath:     rootPath,
-			Capabilities: hostCapabilities,
-		},
-	})
+	ext.enqueue(h.buildInitializeFrame(m, rootPath, initID))
 
 	select {
 	case resp := <-respCh:
@@ -222,6 +214,24 @@ func (h *Host) spawn(m *Manifest) error {
 	go h.waitLoop(ext)
 
 	return nil
+}
+
+// buildInitializeFrame constructs the handshake Initialize request frame for
+// manifest m, injecting the plugin's configured sub-tree (if any) so the
+// spawn path stays symmetric with Emit — which also injects config via
+// Host.pluginConfigFor. Extracted as a named helper so it can be unit-tested
+// without spawning a real subprocess.
+func (h *Host) buildInitializeFrame(m *Manifest, rootPath string, id any) outFrame {
+	return outFrame{
+		isNotif: false,
+		method:  "initialize",
+		id:      id,
+		params: Initialize{
+			RootPath:     rootPath,
+			Capabilities: hostCapabilities,
+			Config:       h.pluginConfigFor(m.Name),
+		},
+	}
 }
 
 // manifestDir returns the on-disk directory for manifest m if it can be

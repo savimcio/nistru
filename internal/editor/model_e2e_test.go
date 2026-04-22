@@ -46,8 +46,9 @@ import (
 	"github.com/charmbracelet/x/exp/teatest"
 	"github.com/kujtimiihoxha/vimtea"
 
-	"github.com/savimcio/nistru/plugin"
+	"github.com/savimcio/nistru/internal/config"
 	"github.com/savimcio/nistru/internal/plugins/treepane"
+	"github.com/savimcio/nistru/plugin"
 )
 
 // The `-update` flag is already registered by a transitive dep (one of the
@@ -180,7 +181,7 @@ func newRenderedModel(t *testing.T, root string, w, h int, setup func(*Model)) s
 	// green "v…" segment into the status bar — the resulting non-determinism
 	// drifts every goldens in this file.
 	disableAutoupdate(t)
-	m, err := NewModel(root)
+	m, err := NewModel(root, nil)
 	if err != nil {
 		t.Fatalf("NewModel(%q): %v", root, err)
 	}
@@ -393,7 +394,7 @@ func TestE2E_EditAutosaveToDisk(t *testing.T) {
 	disableAutoupdate(t)
 	dir := t.TempDir()
 	path := writeFile(t, dir, "note.txt", "seed\n")
-	m, err := NewModel(dir)
+	m, err := NewModel(dir, nil)
 	if err != nil {
 		t.Fatalf("NewModel: %v", err)
 	}
@@ -455,7 +456,7 @@ func TestE2E_PaletteRegisteredCommandExecutes(t *testing.T) {
 	// We construct the Host ourselves so we can inject the test plugin.
 	disableAutoupdate(t)
 	root := emptyRoot(t)
-	m, err := NewModel(root)
+	m, err := NewModel(root, nil)
 	if err != nil {
 		t.Fatalf("NewModel: %v", err)
 	}
@@ -492,7 +493,7 @@ func TestE2E_CtrlCInInsertModeStaysAsCopyAndReturnsToNormal(t *testing.T) {
 	disableAutoupdate(t)
 	dir := t.TempDir()
 	path := writeFile(t, dir, "z.txt", "line1\nline2\n")
-	m, err := NewModel(dir)
+	m, err := NewModel(dir, nil)
 	if err != nil {
 		t.Fatalf("NewModel: %v", err)
 	}
@@ -542,7 +543,7 @@ func TestE2E_CtrlQWithDirtyBufferFlushesBeforeExit(t *testing.T) {
 	disableAutoupdate(t)
 	dir := t.TempDir()
 	path := writeFile(t, dir, "q.txt", "seed\n")
-	m, err := NewModel(dir)
+	m, err := NewModel(dir, nil)
 	if err != nil {
 		t.Fatalf("NewModel: %v", err)
 	}
@@ -900,8 +901,9 @@ func TestE2E_LayoutInvariants(t *testing.T) {
 				//      editorWidth() doesn't subtract, so any two-pane scene
 				//      overhangs by 1 cell.
 				//   2. When the total width is near or below the tree pane
-				//      width (treeWidth=30), the editor's "at least 1 cell"
-				//      clamp pushes the overhang to 2 cells.
+				//      width (default 30, from config.Defaults()), the
+				//      editor's "at least 1 cell" clamp pushes the overhang
+				//      to 2 cells.
 				// The structural invariant the test actually enforces is "no
 				// runaway overflow" (e.g. a regression that renders the full
 				// path uncropped into the status bar).
@@ -912,7 +914,7 @@ func TestE2E_LayoutInvariants(t *testing.T) {
 					tolerance = 1
 					// Tiny widths: editor is clamped to min-1, border still
 					// adds 1, so total overhang is 2.
-					if w <= treeWidth {
+					if w <= config.Defaults().UI.TreeWidth {
 						tolerance = 2
 					}
 				}

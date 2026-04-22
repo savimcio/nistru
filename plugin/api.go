@@ -51,6 +51,12 @@ type Initialize struct {
 	RootPath string `json:"rootPath"`
 	// Capabilities advertises host-side capabilities the plugin may rely on.
 	Capabilities []string `json:"capabilities"`
+	// Config is the plugin's own config sub-tree, encoded as raw JSON. It is
+	// nil when no host-side config lookup is installed or when the lookup
+	// returns nothing for this plugin's name. Plugins that prefer to receive
+	// config out of band can implement ConfigReceiver instead; both channels
+	// are kept in sync and carry the same bytes.
+	Config json.RawMessage `json:"config,omitempty"`
 }
 
 // Shutdown is emitted once before the plugin is torn down. Distinct from the
@@ -109,6 +115,13 @@ type Invalidate struct{}
 
 func (Invalidate) isEffect() {}
 
+// ReloadConfigRequest asks the editor to reload its configuration files and
+// re-emit per-plugin config via the host. Handled entirely on the editor
+// side; the plugin package has no knowledge of config file layout.
+type ReloadConfigRequest struct{}
+
+func (ReloadConfigRequest) isEffect() {}
+
 // Capability names a host-provided extension point a plugin may use.
 type Capability string
 
@@ -159,4 +172,24 @@ type Plugin interface {
 // before the Initialize event is dispatched.
 type HostAware interface {
 	SetHost(h *Host)
+}
+
+// ConfigReceiver is an optional extension implemented by in-process plugins
+// that want to receive their own config sub-tree out of band from the
+// Initialize event. The Host calls OnConfig immediately before dispatching
+// the Initialize event the first time, and again on every ReloadConfig call.
+// If the plugin also reads the Config field of Initialize it will see the
+// same bytes.
+//
+// OnConfig fires on every Initialize dispatch (initial boot and every
+// subsequent reload), regardless of whether a config sub-tree is present.
+// A nil raw argument means `[plugins.<name>]` is absent from the effective
+// config; plugins should treat this as a reset/defaults signal. The same
+// uniform contract applies to out-of-process plugins via plugsdk's
+// ConfigReceiver — both transports behave identically on the wire.
+// Implementations MUST treat a nil/empty raw as a reset rather than a
+// no-op, otherwise removing a config section will leave stale state
+// behind.
+type ConfigReceiver interface {
+	OnConfig(raw json.RawMessage) error
 }

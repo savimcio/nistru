@@ -1,6 +1,7 @@
 package treepane
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -433,6 +434,124 @@ func TestTreePane_WidthResponsive(t *testing.T) {
 				t.Fatalf("width %d: missing expanded marker ▾ in:\n%s", w, out)
 			}
 		})
+	}
+}
+
+// TestPlugin_OnConfig_RebuildsTree exercises the ConfigReceiver path: an
+// explicit empty skip_dirs array must stop node_modules from being hidden on
+// the next Initialize. This covers both config plumbing (OnConfig parses the
+// array) and the deferred rebuild (OnEvent(Initialize) re-walks the fs). The
+// inverse case — trimming the default set to exclude vendor, for example — is
+// covered transitively because the same code path runs.
+func TestPlugin_OnConfig_RebuildsTree(t *testing.T) {
+	root := buildFixture(t, map[string]string{
+		"node_modules/":         "",
+		"node_modules/pkg.json": "{}",
+		"src/":                  "",
+		"src/main.go":           "package main",
+	})
+	p, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	// Default skip set hides node_modules.
+	out := p.Render(80, 20)
+	if strings.Contains(out, "node_modules") {
+		t.Fatalf("default render unexpectedly shows node_modules:\n%s", out)
+	}
+
+	// Explicit empty array == skip nothing. Call OnConfig then re-fire
+	// Initialize the way the host would on reload.
+	if err := p.OnConfig([]byte(`{"skip_dirs":[]}`)); err != nil {
+		t.Fatalf("OnConfig: %v", err)
+	}
+	// OnConfig only swaps the skip set; OnEvent(Initialize) drives the
+	// rebuild — exactly the sequence Host.ReEmitInitialize produces.
+	p.OnEvent(plugin.Initialize{RootPath: root})
+
+	out = p.Render(80, 20)
+	if !strings.Contains(out, "node_modules") {
+		t.Fatalf("after skip_dirs=[] render missing node_modules:\n%s", out)
+	}
+	if !strings.Contains(out, "src") {
+		t.Fatalf("after reload render missing src/:\n%s", out)
+	}
+
+	// Omitting skip_dirs on a subsequent reload resets the set back to the
+	// defaults — the ConfigReceiver contract is "OnConfig represents the
+	// effective config at this moment; absent = default".
+	if err := p.OnConfig([]byte(`{}`)); err != nil {
+		t.Fatalf("OnConfig empty: %v", err)
+	}
+	p.OnEvent(plugin.Initialize{RootPath: root})
+	out = p.Render(80, 20)
+	if strings.Contains(out, "node_modules") {
+		t.Fatalf("omitted skip_dirs did not reset to defaults (node_modules still visible):\n%s", out)
+	}
+	if !strings.Contains(out, "src") {
+		t.Fatalf("after reset render missing src/:\n%s", out)
+	}
+
+	// Malformed JSON surfaces as an error but does not mutate state.
+	if err := p.OnConfig([]byte(`{bad json`)); err == nil {
+		t.Fatalf("OnConfig(bad) returned nil err, want decode error")
+	}
+}
+
+// TestPlugin_OnConfig_Nil_ResetsToDefaults covers the Host.ReEmitInitialize
+// reload path where a user has removed [plugins.treepane] entirely: the host
+// now invokes OnConfig(nil) and the plugin must reset its skip set to the
+// in-code defaults rather than retaining the previous (now stale) override.
+func TestPlugin_OnConfig_Nil_ResetsToDefaults(t *testing.T) {
+	root := buildFixture(t, map[string]string{
+		"node_modules/":         "",
+		"node_modules/pkg.json": "{}",
+		"src/":                  "",
+		"src/main.go":           "package main",
+	})
+	p, err := New(root)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Install an explicit override that skips nothing; confirm node_modules
+	// is visible after the rebuild.
+	if err := p.OnConfig([]byte(`{"skip_dirs":[]}`)); err != nil {
+		t.Fatalf("OnConfig(skip_dirs=[]): %v", err)
+	}
+	p.OnEvent(plugin.Initialize{RootPath: root})
+	out := p.Render(80, 20)
+	if !strings.Contains(out, "node_modules") {
+		t.Fatalf("pre-nil render missing node_modules:\n%s", out)
+	}
+
+	// Simulate the user deleting the [plugins.treepane] section entirely.
+	// The host's reload path now calls OnConfig(nil); the plugin must drop
+	// its previous override and restore the in-code defaults.
+	if err := p.OnConfig(nil); err != nil {
+		t.Fatalf("OnConfig(nil): %v", err)
+	}
+	p.OnEvent(plugin.Initialize{RootPath: root})
+	out = p.Render(80, 20)
+	if strings.Contains(out, "node_modules") {
+		t.Fatalf("after OnConfig(nil) node_modules is still visible — skip set did not reset:\n%s", out)
+	}
+	if !strings.Contains(out, "src") {
+		t.Fatalf("after OnConfig(nil) src/ is missing:\n%s", out)
+	}
+
+	// Zero-length raw (json.RawMessage{}) must take the same reset path.
+	if err := p.OnConfig([]byte(`{"skip_dirs":[]}`)); err != nil {
+		t.Fatalf("OnConfig(restore override): %v", err)
+	}
+	p.OnEvent(plugin.Initialize{RootPath: root})
+	if err := p.OnConfig(json.RawMessage{}); err != nil {
+		t.Fatalf("OnConfig(empty raw): %v", err)
+	}
+	p.OnEvent(plugin.Initialize{RootPath: root})
+	out = p.Render(80, 20)
+	if strings.Contains(out, "node_modules") {
+		t.Fatalf("after OnConfig(empty) node_modules is still visible:\n%s", out)
 	}
 }
 

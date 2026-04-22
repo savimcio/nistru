@@ -107,13 +107,14 @@ var hostCapabilities = []string{
 type Host struct {
 	registry *Registry
 
-	mu        sync.RWMutex
-	rootPath  string
-	started   bool
-	running   map[string]*extPlugin // name -> running external plugin
-	activated map[string]bool       // name -> has seen a matching activation
-	unhealthy map[string]bool       // in-proc plugins that panicked
-	inbound   chan PluginMsg
+	mu           sync.RWMutex
+	rootPath     string
+	started      bool
+	running      map[string]*extPlugin // name -> running external plugin
+	activated    map[string]bool       // name -> has seen a matching activation
+	unhealthy    map[string]bool       // in-proc plugins that panicked
+	inbound      chan PluginMsg
+	pluginConfig func(name string) json.RawMessage
 
 	// commands is *map[string]CommandRef, replaced via atomic.Value on each
 	// register/unregister so Commands() is lock-free for readers.
@@ -165,6 +166,29 @@ func (h *Host) Start(rootPath string) error {
 	return nil
 }
 
+// SetPluginConfig installs the per-plugin config lookup function. The host
+// calls it for every plugin that receives an Initialize event, and may call
+// it again from ReloadConfig (added in a later task). Passing nil clears
+// the lookup, returning the host to default "no config" behaviour. Safe to
+// call at any time; holds h.mu for the swap only.
+func (h *Host) SetPluginConfig(fn func(name string) json.RawMessage) {
+	h.mu.Lock()
+	h.pluginConfig = fn
+	h.mu.Unlock()
+}
+
+// pluginConfigFor returns the config bytes installed for the named plugin,
+// or nil when no lookup is installed or the lookup returns nothing.
+func (h *Host) pluginConfigFor(name string) json.RawMessage {
+	h.mu.RLock()
+	fn := h.pluginConfig
+	h.mu.RUnlock()
+	if fn == nil {
+		return nil
+	}
+	return fn(name)
+}
+
 // PostNotif enqueues a synthetic JSON-RPC notification on the host's
 // inbound channel, as if it had arrived from an out-of-process plugin.
 // Safe to call from any goroutine. Non-blocking: if the inbound channel
@@ -203,6 +227,7 @@ func (h *Host) PostNotif(plugin, method string, params any) error {
 // plugins' effects arrive later as PluginNotifMsg via Recv.
 func (h *Host) Emit(event any) []Effect {
 	method, params, actEv, hasActivation := describeEvent(event)
+	_, isInit := event.(Initialize)
 
 	var effects []Effect
 
@@ -212,7 +237,31 @@ func (h *Host) Emit(event any) []Effect {
 			continue
 		}
 		h.markActivated(p.Name())
-		ef := h.callOnEvent(p, event)
+
+		ev := event
+		if isInit {
+			raw := h.pluginConfigFor(p.Name())
+			// Deliver OnConfig first for plugins that opt into the out-of-band
+			// channel. OnConfig fires on every Initialize dispatch — even when
+			// raw is nil — so receivers see a uniform contract at both initial
+			// boot and reload. A nil raw signals "no [plugins.<name>] section
+			// is present; reset/keep defaults". See ConfigReceiver in api.go.
+			// Errors log but do not block Initialize; panics mark the plugin
+			// unhealthy and skip further events this session.
+			if cr, ok := p.(ConfigReceiver); ok {
+				if h.callOnConfig(p.Name(), cr, raw) {
+					// Unhealthy after panic; skip the Initialize event too.
+					continue
+				}
+			}
+			// Clone the Initialize value per-plugin so each sees its own
+			// config sub-tree.
+			init := event.(Initialize)
+			init.Config = raw
+			ev = init
+		}
+
+		ef := h.callOnEvent(p, ev)
 		effects = append(effects, ef...)
 	}
 
@@ -236,10 +285,39 @@ func (h *Host) Emit(event any) []Effect {
 			// Event has no wire representation (unknown type). Skip silently.
 			continue
 		}
-		ext.sendEvent(method, params, event)
+
+		// Per-plugin params clone for Initialize so each out-of-proc plugin
+		// receives its own config sub-tree. Keep params/raw in sync so the
+		// coalescing path sees a consistent pair.
+		sendParams := params
+		sendRaw := event
+		if isInit {
+			init := event.(Initialize)
+			init.Config = h.pluginConfigFor(m.Name)
+			sendParams = init
+			sendRaw = init
+		}
+		ext.sendEvent(method, sendParams, sendRaw)
 	}
 
 	return effects
+}
+
+// callOnConfig invokes cr.OnConfig with panic recovery. Returns true when a
+// panic marked the plugin unhealthy. OnConfig-returned errors are logged to
+// stderr but do NOT mark the plugin unhealthy, letting Initialize still land.
+func (h *Host) callOnConfig(name string, cr ConfigReceiver, raw json.RawMessage) (unhealthy bool) {
+	defer func() {
+		// Panic boundary: a misbehaving OnConfig must not take down the host.
+		if r := recover(); r != nil {
+			h.markUnhealthy(name, fmt.Errorf("panic in OnConfig: %v", r))
+			unhealthy = true
+		}
+	}()
+	if err := cr.OnConfig(raw); err != nil {
+		fmt.Fprintf(os.Stderr, "plugin: %s: OnConfig: %v\n", name, err)
+	}
+	return false
 }
 
 // isInProcName reports whether the given name is an in-proc plugin. Avoids
@@ -524,6 +602,88 @@ func (h *Host) ExecuteCommand(id string, args json.RawMessage) CommandResult {
 	return CommandResult{Sync: &CommandSyncResult{
 		Err: fmt.Errorf("plugin: owner %q of command %q is not registered", ref.Plugin, id),
 	}}
+}
+
+// ReEmitInitialize re-delivers the Initialize event to every plugin that
+// has already been activated, so they can pick up fresh per-plugin config
+// after a SetPluginConfig swap. In-proc plugins receive OnConfig + the
+// Initialize event via OnEvent; out-of-proc plugins receive a fresh
+// initialize JSON-RPC notification (NOT a new spawn handshake — they are
+// already running). New plugins never seen before are NOT started here.
+//
+// Must be called on the Bubble Tea UI goroutine to preserve the
+// "in-proc OnEvent runs on UI goroutine" invariant.
+func (h *Host) ReEmitInitialize() {
+	// Snapshot the activated + rootPath under RLock so the subsequent
+	// dispatch loop doesn't need to re-acquire. Also snapshot the unhealthy
+	// set — unhealthy plugins must be skipped so we don't revive them.
+	h.mu.RLock()
+	rootPath := h.rootPath
+	activated := make(map[string]bool, len(h.activated))
+	for k, v := range h.activated {
+		activated[k] = v
+	}
+	unhealthy := make(map[string]bool, len(h.unhealthy))
+	for k, v := range h.unhealthy {
+		unhealthy[k] = v
+	}
+	running := make(map[string]*extPlugin, len(h.running))
+	for k, v := range h.running {
+		running[k] = v
+	}
+	h.mu.RUnlock()
+
+	// In-proc dispatch: every in-proc plugin that has been activated gets a
+	// fresh OnConfig (if implemented) then a fresh Initialize OnEvent.
+	//
+	// OnConfig fires unconditionally — even when raw is nil — matching the
+	// initial Emit path's behaviour. A nil raw signals "the config section
+	// is absent now; reset any config-derived state to defaults". Without
+	// this, a user who deletes a [plugins.<name>] section and reloads would
+	// still observe stale config-derived state inside the plugin. See
+	// ConfigReceiver in plugin/api.go for the nil-raw contract.
+	for _, p := range h.registry.InProc() {
+		name := p.Name()
+		if !activated[name] || unhealthy[name] {
+			continue
+		}
+		raw := h.pluginConfigFor(name)
+		if cr, ok := p.(ConfigReceiver); ok {
+			if h.callOnConfig(name, cr, raw) {
+				// Panic marked the plugin unhealthy; skip the event dispatch.
+				continue
+			}
+		}
+		init := Initialize{
+			RootPath:     rootPath,
+			Capabilities: hostCapabilities,
+			Config:       raw,
+		}
+		_ = h.callOnEvent(p, init)
+	}
+
+	// Out-of-proc dispatch: only already-running plugins. We deliberately
+	// do NOT call ensureSpawned — this is a re-emit, not a cold start.
+	for _, m := range h.registry.Manifests() {
+		name := m.Name
+		// An in-proc plugin with the same name wins (mirrors Emit).
+		if h.isInProcName(name) {
+			continue
+		}
+		if unhealthy[name] {
+			continue
+		}
+		ext, ok := running[name]
+		if !ok {
+			continue
+		}
+		init := Initialize{
+			RootPath:     rootPath,
+			Capabilities: hostCapabilities,
+			Config:       h.pluginConfigFor(name),
+		}
+		ext.sendEvent("initialize", init, init)
+	}
 }
 
 // Recv returns a tea.Cmd that blocks on the aggregated inbound channel and

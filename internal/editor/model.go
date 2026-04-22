@@ -13,28 +13,24 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kujtimiihoxha/vimtea"
 
+	"github.com/savimcio/nistru/internal/config"
 	"github.com/savimcio/nistru/internal/plugins/autoupdate"
+	"github.com/savimcio/nistru/internal/plugins/settingscmd"
 	"github.com/savimcio/nistru/internal/plugins/treepane"
 	"github.com/savimcio/nistru/plugin"
 )
 
-// App-level key constants. Inlining these rather than splitting into keys.go
-// because there are only a handful.
-const (
-	keyTab      = "tab"
-	keyShiftTab = "shift+tab"
-	keyCtrlS    = "ctrl+s"
-	keyCtrlQ    = "ctrl+q"
-	keyCtrlC    = "ctrl+c"
-	keyCtrlP    = "ctrl+p"
-)
+// keyCtrlC is the tree-pane's universal quit intercept. It stays hardcoded
+// regardless of the user's keymap because Ctrl+C is the terminal's universal
+// interrupt contract — rebinding it would break muscle memory. Every other
+// app-level binding flows through m.cfg.Keymap.
+const keyCtrlC = "ctrl+c"
 
-// Layout constants.
+// Layout constants. Only statusBarLines is truly fixed; the other knobs
+// (treeWidth, maxFileSize, savedFadeAfter) now live on the Model via
+// m.cfg (UI.TreeWidth, Editor.MaxFileSize, UI.SavedFadeAfter).
 const (
-	treeWidth      = 30
 	statusBarLines = 1
-	maxFileSize    = 1 << 20 // 1 MiB — refuse to open files larger than this
-	savedFadeAfter = 3 * time.Second
 )
 
 type focus int
@@ -67,6 +63,7 @@ type statusSegment struct {
 // autosave/change-debounce bookkeeping.
 type Model struct {
 	root string
+	cfg  *config.Config
 
 	host     *plugin.Host
 	registry *plugin.Registry
@@ -107,8 +104,18 @@ type Model struct {
 }
 
 // NewModel constructs the initial app model rooted at root. The editor starts
-// empty; opening a file through the tree replaces it.
-func NewModel(root string) (*Model, error) {
+// empty; opening a file through the tree replaces it. A nil cfg is equivalent
+// to config.Defaults() — tests that don't care about configuration pass nil
+// and get the built-in defaults without having to thread a loader through.
+//
+// The settingscmd plugin needs a live handle to the Model's config so its
+// showResolved / reload commands reflect the post-reload state. We solve the
+// circular dependency with a pointer-to-pointer: mref is nil until
+// newModelWithRegistry finishes building m, then gets its address. settingscmd
+// only calls getCfg lazily (on palette command invocation), never during
+// registration, so "nil mref means cfg is not ready yet" never fires in
+// practice — but the fallback keeps the closure total.
+func NewModel(root string, cfg *config.Config) (*Model, error) {
 	registry := plugin.NewRegistry()
 
 	tp, err := treepane.New(root)
@@ -119,7 +126,21 @@ func NewModel(root string) (*Model, error) {
 
 	registry.RegisterInProc(autoupdate.New())
 
-	return newModelWithRegistry(root, registry)
+	var mref *Model
+	getCfg := func() *config.Config {
+		if mref == nil {
+			return cfg
+		}
+		return mref.cfg
+	}
+	registry.RegisterInProc(settingscmd.New(root, getCfg))
+
+	m, err := newModelWithRegistry(root, registry, cfg)
+	if err != nil {
+		return nil, err
+	}
+	mref = m
+	return m, nil
 }
 
 // newModelWithRegistry is the shared constructor used by NewModel and by
@@ -134,8 +155,14 @@ func NewModel(root string) (*Model, error) {
 // through PostNotif whose host-side bookkeeping runs before the inbound
 // channel send, so the subsequent host.Commands() snapshot already includes
 // anything a plugin registered during Initialize.
-func newModelWithRegistry(root string, registry *plugin.Registry) (*Model, error) {
+func newModelWithRegistry(root string, registry *plugin.Registry, cfg *config.Config) (*Model, error) {
+	if cfg == nil {
+		cfg = config.Defaults()
+	}
 	host := plugin.NewHost(registry)
+	// Install the per-plugin config lookup BEFORE Start/Emit so Initialize
+	// carries each plugin's sub-tree in the same dispatch.
+	host.SetPluginConfig(cfg.PluginConfig)
 	if err := host.Start(root); err != nil {
 		return nil, fmt.Errorf("start plugin host: %w", err)
 	}
@@ -144,11 +171,12 @@ func newModelWithRegistry(root string, registry *plugin.Registry) (*Model, error
 
 	m := &Model{
 		root:     root,
+		cfg:      cfg,
 		host:     host,
 		registry: registry,
 		leftPane: host.Pane("left"),
 		commands: host.Commands(),
-		editor:   newEditor("", ""),
+		editor:   newEditor("", "", &editorOpts{Keymap: cfg.Keymap, RelativeNumbers: cfg.UI.RelativeNumbers}),
 		focus:    focusTree,
 	}
 	return m, nil
@@ -168,9 +196,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		contentH = max(contentH, 1)
 		editorW := m.editorWidth()
 		if m.leftPane != nil {
-			if treeWidth != m.lastPaneW || contentH != m.lastPaneH {
-				m.leftPane.OnResize(treeWidth, contentH)
-				m.lastPaneW = treeWidth
+			tw := m.treeWidth()
+			if tw != m.lastPaneW || contentH != m.lastPaneH {
+				m.leftPane.OnResize(tw, contentH)
+				m.lastPaneW = tw
 				m.lastPaneH = contentH
 			}
 		}
@@ -248,13 +277,82 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // editorWidth returns the editor's width in cells, allowing for a missing
-// left pane (in which case the editor fills the screen).
+// left pane (in which case the editor fills the screen). The tree pane's
+// width comes from the user's config via m.cfg.UI.TreeWidth; falling back to
+// the default keeps partially-initialised test Models (m.cfg == nil) safe.
 func (m *Model) editorWidth() int {
 	w := m.width
 	if m.leftPane != nil {
-		w = m.width - treeWidth
+		w = m.width - m.treeWidth()
 	}
 	return max(w, 1)
+}
+
+// treeWidth returns the configured left-pane width, defaulting to the
+// built-in constant when m.cfg is nil (i.e. in hand-constructed test
+// Models).
+func (m *Model) treeWidth() int {
+	if m.cfg == nil {
+		return config.Defaults().UI.TreeWidth
+	}
+	return m.cfg.UI.TreeWidth
+}
+
+// keymap returns the active Keymap, falling back to the built-in defaults
+// when m.cfg is nil. Hand-built test Models routinely skip wiring m.cfg, so
+// the defensive return keeps every keypath safe without burdening each call
+// site with a nil check.
+func (m *Model) keymap() config.Keymap {
+	if m.cfg == nil {
+		return config.DefaultKeymap()
+	}
+	return m.cfg.Keymap
+}
+
+// savedFadeAfter returns the UI.SavedFadeAfter duration, falling back to
+// the built-in default when m.cfg is nil.
+func (m *Model) savedFadeAfter() time.Duration {
+	if m.cfg == nil {
+		return config.Defaults().UI.SavedFadeAfter
+	}
+	return m.cfg.UI.SavedFadeAfter
+}
+
+// maxFileSize returns the open-file size ceiling, falling back to the
+// built-in default when m.cfg is nil.
+func (m *Model) maxFileSize() uint64 {
+	if m.cfg == nil {
+		return uint64(config.Defaults().Editor.MaxFileSize)
+	}
+	return uint64(m.cfg.Editor.MaxFileSize)
+}
+
+// editorOptsFromCfg returns the editorOpts derived from m.cfg, suitable for
+// passing to newEditor. Returns nil when m.cfg is nil so newEditor falls
+// back to its own defaults.
+func (m *Model) editorOptsFromCfg() *editorOpts {
+	if m.cfg == nil {
+		return nil
+	}
+	return &editorOpts{Keymap: m.cfg.Keymap, RelativeNumbers: m.cfg.UI.RelativeNumbers}
+}
+
+// saveDebounce returns the autosave debounce window, falling back to the
+// built-in default when m.cfg is nil.
+func (m *Model) saveDebounce() time.Duration {
+	if m.cfg == nil {
+		return config.Defaults().Autosave.SaveDebounce
+	}
+	return m.cfg.Autosave.SaveDebounce
+}
+
+// changeDebounce returns the DidChange debounce window, falling back to the
+// built-in default when m.cfg is nil.
+func (m *Model) changeDebounce() time.Duration {
+	if m.cfg == nil {
+		return config.Defaults().Autosave.ChangeDebounce
+	}
+	return m.cfg.Autosave.ChangeDebounce
 }
 
 // handlePluginNotif translates an inbound JSON-RPC notification from an
@@ -317,7 +415,7 @@ func (m *Model) handlePluginReq(msg plugin.PluginReqMsg) (tea.Model, tea.Cmd) {
 			})
 			return m, m.host.Recv()
 		}
-		m.editor = newEditor(p.Text, p.Path)
+		m.editor = newEditor(p.Text, p.Path, m.editorOptsFromCfg())
 		contentH := m.height - statusBarLines
 		contentH = max(contentH, 1)
 		if newEd, _ := m.editor.SetSize(m.editorWidth(), contentH); newEd != nil {
@@ -408,11 +506,13 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.palette.open {
 		return m.handlePaletteKey(msg)
 	}
-	switch msg.String() {
-	case keyCtrlP:
+	key := msg.String()
+	km := m.keymap()
+	switch key {
+	case km.Lookup(config.ActionPalette):
 		m.palette.Open(m.commands)
 		return m, nil
-	case keyTab, keyShiftTab:
+	case km.Lookup(config.ActionFocusNext), km.Lookup(config.ActionFocusPrev):
 		prev := m.focus
 		if m.focus == focusTree {
 			m.focus = focusEditor
@@ -424,7 +524,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case keyCtrlS:
+	case km.Lookup(config.ActionSave):
 		// App-wide manual save, works regardless of focus and mode.
 		if err := m.flushNow(); err != nil {
 			m.statusErr = err.Error()
@@ -432,7 +532,7 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, m.editor.SetStatusMessage("saved")
 
-	case keyCtrlQ:
+	case km.Lookup(config.ActionQuit):
 		return m.guardedQuit()
 	}
 
@@ -529,8 +629,8 @@ func (m *Model) forwardToFocused(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.dirty = true
 			m.saveGen++
 			m.changeGen++
-			tick := scheduleSave(m.saveGen)
-			changeTick := scheduleChange(m.changeGen)
+			tick := scheduleSave(m.saveGen, m.saveDebounce())
+			changeTick := scheduleChange(m.changeGen, m.changeDebounce())
 			if cmd == nil {
 				return m, tea.Batch(tick, changeTick)
 			}
@@ -583,6 +683,10 @@ func (m *Model) applyEffects(effs []plugin.Effect) tea.Cmd {
 			}
 		case plugin.Invalidate:
 			// No-op: Bubble Tea repaints every tick.
+		case plugin.ReloadConfigRequest:
+			// The reload lives in a method so the surrounding switch stays a
+			// routing table — the flow is too big to inline.
+			cmds = append(cmds, m.reloadConfig())
 		}
 	}
 	if len(cmds) == 0 {
@@ -592,6 +696,107 @@ func (m *Model) applyEffects(effs []plugin.Effect) tea.Cmd {
 		return cmds[0]
 	}
 	return tea.Batch(cmds...)
+}
+
+// reloadConfig reparses the layered TOML config from disk, swaps the
+// Model's cfg in place so every closure holding m.cfg sees the update,
+// pushes the new plugin lookup into the host, and re-emits Initialize to
+// already-activated plugins so they can pick up fresh per-plugin config.
+// Warnings are printed to stderr in the same style as cmd/nistru/main.go
+// — we duplicate the loop here rather than extract a helper, because the
+// one-line format is trivial and both call sites stay independent.
+//
+// A vimtea.Editor baked in its opts at construction time (relative numbers
+// and the Ctrl-binding keymap), so for those specific knobs we detect a
+// change and rebuild the editor instance in place. Content and file path
+// are preserved; cursor position and vim mode are reset — acceptable v1
+// tradeoff, called out in the return contract.
+func (m *Model) reloadConfig() tea.Cmd {
+	newCfg, warnings, err := config.Load(m.root)
+	if err != nil {
+		return m.editor.SetStatusMessage("reload failed: " + err.Error())
+	}
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "nistru: config: %s: %s\n", w.Source, w.Message)
+	}
+	// Snapshot the editor-relevant knobs BEFORE the in-place mutation so the
+	// post-swap comparison has something to diff against. Copying the Keymap
+	// (a map) is necessary because *m.cfg = *newCfg shares the underlying
+	// map header — without a snapshot, oldKeymap would already reflect the
+	// new bindings by the time we compared.
+	var oldKnobs editorKnobs
+	if m.cfg != nil {
+		oldKnobs = snapshotEditorKnobs(m.cfg)
+	}
+
+	// In-place mutation preserves m.cfg's address so any closure captured
+	// during construction (e.g. settingscmd's getCfg) automatically sees
+	// the fresh values without needing a refresh hook.
+	if m.cfg != nil && newCfg != nil {
+		*m.cfg = *newCfg
+	} else {
+		m.cfg = newCfg
+	}
+
+	var initCmd tea.Cmd
+	if m.cfg != nil && editorKnobsChanged(oldKnobs, snapshotEditorKnobs(m.cfg)) {
+		buf := m.editor.GetBuffer().Text()
+		m.editor = newEditor(buf, m.openPath, m.editorOptsFromCfg())
+		contentH := m.height - statusBarLines
+		contentH = max(contentH, 1)
+		if newEd, _ := m.editor.SetSize(m.editorWidth(), contentH); newEd != nil {
+			if e, ok := newEd.(vimtea.Editor); ok {
+				m.editor = e
+			}
+		}
+		initCmd = m.editor.Init()
+	}
+
+	m.host.SetPluginConfig(m.cfg.PluginConfig)
+	m.host.ReEmitInitialize()
+
+	msg := m.editor.SetStatusMessage("settings reloaded")
+	if initCmd != nil {
+		return tea.Batch(initCmd, msg)
+	}
+	return msg
+}
+
+// editorKnobs is the subset of config.Config that the vimtea editor bakes in
+// at construction time — changing any of these means we must rebuild the
+// editor instance for the change to take effect.
+type editorKnobs struct {
+	relativeNumbers bool
+	undoKey         string
+	redoKey         string
+	cutKey          string
+	copyKey         string
+	pasteKey        string
+}
+
+// snapshotEditorKnobs copies the editor-relevant fields out of cfg into a
+// plain struct so they survive an in-place overwrite of *m.cfg. cfg must be
+// non-nil.
+func snapshotEditorKnobs(cfg *config.Config) editorKnobs {
+	km := cfg.Keymap
+	if km == nil {
+		km = config.DefaultKeymap()
+	}
+	return editorKnobs{
+		relativeNumbers: cfg.UI.RelativeNumbers,
+		undoKey:         km.Lookup(config.ActionUndo),
+		redoKey:         km.Lookup(config.ActionRedo),
+		cutKey:          km.Lookup(config.ActionCutLine),
+		copyKey:         km.Lookup(config.ActionCopyLine),
+		pasteKey:        km.Lookup(config.ActionPaste),
+	}
+}
+
+// editorKnobsChanged reports whether any editor-relevant knob differs between
+// two snapshots. A plain struct equality check would suffice today, but the
+// named helper documents intent at the call site.
+func editorKnobsChanged(a, b editorKnobs) bool {
+	return a != b
 }
 
 // openFile handles opening path: read the file, guard against binary/oversize
@@ -607,8 +812,9 @@ func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 	if info.IsDir() {
 		return m, nil
 	}
-	if info.Size() > maxFileSize {
-		return m, m.editor.SetStatusMessage(fmt.Sprintf("refusing: file > %d bytes", maxFileSize))
+	maxSz := m.maxFileSize()
+	if uint64(info.Size()) > maxSz {
+		return m, m.editor.SetStatusMessage(fmt.Sprintf("refusing: file > %d bytes", maxSz))
 	}
 
 	b, err := os.ReadFile(path)
@@ -635,7 +841,7 @@ func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 	prevPath := m.openPath
 
 	content := string(b)
-	m.editor = newEditor(content, path)
+	m.editor = newEditor(content, path, m.editorOptsFromCfg())
 
 	// Push the current size into the new editor instance.
 	contentH := m.height - statusBarLines
@@ -731,21 +937,22 @@ func (m *Model) View() string {
 
 	var content string
 	if m.leftPane != nil {
+		tw := m.treeWidth()
 		// Notify pane of current dims if they changed since last Render.
-		if treeWidth != m.lastPaneW || contentH != m.lastPaneH {
-			m.leftPane.OnResize(treeWidth, contentH)
-			m.lastPaneW = treeWidth
+		if tw != m.lastPaneW || contentH != m.lastPaneH {
+			m.leftPane.OnResize(tw, contentH)
+			m.lastPaneW = tw
 			m.lastPaneH = contentH
 		}
 		treeStyle := lipgloss.NewStyle().
-			Width(treeWidth).
+			Width(tw).
 			Height(contentH).
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderRight(true)
 		if m.focus == focusTree {
 			treeStyle = treeStyle.BorderForeground(lipgloss.Color("205"))
 		}
-		treePane := treeStyle.Render(m.leftPane.Render(treeWidth, contentH))
+		treePane := treeStyle.Render(m.leftPane.Render(tw, contentH))
 		editorPane := editorStyle.Render(m.editor.View())
 		content = lipgloss.JoinHorizontal(lipgloss.Top, treePane, editorPane)
 	} else {
@@ -778,7 +985,7 @@ func (m *Model) renderStatusBar() string {
 		saveIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("! " + m.statusErr)
 	case m.dirty:
 		saveIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render("● unsaved")
-	case !m.lastSavedAt.IsZero() && time.Since(m.lastSavedAt) < savedFadeAfter:
+	case !m.lastSavedAt.IsZero() && time.Since(m.lastSavedAt) < m.savedFadeAfter():
 		saveIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render("✓ saved")
 	default:
 		saveIndicator = ""

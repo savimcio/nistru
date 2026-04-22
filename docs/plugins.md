@@ -70,6 +70,55 @@ Plugins are **lazy**: the subprocess is only spawned when the first matching eve
 | `status-bar` | Plugin writes to the status bar |
 | `pane` | In-process only: plugin owns a layout slot |
 
+## Plugin configuration
+
+Plugins receive per-plugin config from Nistru's layered TOML file. Config lives under `[plugins.<name>]` in either:
+
+- `~/.config/nistru/config.toml` — user-wide.
+- `<root>/.nistru/config.toml` — project-local (overrides user).
+
+The `<name>` matches `Plugin.Name()`. Unknown sub-tables are kept; Nistru does not gate on schema. See [internal/config/](../internal/config/) for the merge pipeline.
+
+### Receiving config
+
+Implement the `ConfigReceiver` interface. The plugin host (in-proc) and SDK (out-of-proc) call `OnConfig` with the raw JSON bytes of the `[plugins.<name>]` sub-table before the first `Initialize`:
+
+```go
+// In-process plugin: plugin.ConfigReceiver (plugin/api.go).
+func (p *MyPlugin) OnConfig(raw json.RawMessage) error {
+    var cfg struct {
+        Enabled bool `json:"enabled"`
+    }
+    return json.Unmarshal(raw, &cfg)
+}
+```
+
+```go
+// Out-of-process plugin: plugsdk.ConfigReceiver (sdk/plugsdk/plugsdk.go).
+// plugsdk.Base provides a no-op OnConfig so embedders only override when needed.
+func (p *MyPlugin) OnConfig(raw json.RawMessage) error {
+    var cfg struct {
+        Enabled bool `json:"enabled"`
+    }
+    return json.Unmarshal(raw, &cfg)
+}
+```
+
+`raw` is `nil` when no `[plugins.<name>]` section exists. Handle `nil` as "use defaults."
+
+### When OnConfig fires
+
+1. **Once before the first `Initialize`** — in-proc, synchronously on the host goroutine; out-of-proc, injected into the spawn handshake's first Initialize frame so the SDK dispatches `OnConfig` before `OnInitialize`.
+2. **Again on every `Nistru: Reload Settings` palette invocation** — the host reparses both config files and re-emits `Initialize` to every already-activated plugin. `OnConfig` sees the fresh sub-tree each time.
+
+Errors returned from `OnConfig` are logged to stderr but non-fatal. `Initialize` still proceeds so a plugin with a malformed config section starts up with whatever state it had before the bad config was applied.
+
+### Autoupdate env vars
+
+The `autoupdate` plugin predates the config system. Its `NISTRU_AUTOUPDATE_{REPO,CHANNEL,INTERVAL,DISABLE}` env vars are kept as an emergency override path but are deprecated — prefer `[plugins.autoupdate]` in TOML.
+
+Precedence (low → high): defaults < config < env < construction-time options. The option layer exists purely as a test seam (`WithRepo`, `WithInterval`); env stays above config so a shell-level override can still unblock a user whose config is broken.
+
 ## Writing an out-of-process plugin
 
 Use the Go SDK at `github.com/savimcio/nistru/sdk/plugsdk`. Any language works over the wire, but the SDK is the shortest path.
