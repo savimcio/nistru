@@ -4,6 +4,8 @@
 cmd/nistru/nistru
 /examples/plugins/hello-world/hello-world
 /examples/plugins/gofmt/gofmt-plugin
+# Goreleaser build output
+/dist/
 *.swp
 .DS_Store
 coverage.out

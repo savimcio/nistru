@@ -1,0 +1,85 @@
+version: 2
+
+project_name: nistru
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: nistru
+    main: ./cmd/nistru
+    binary: nistru
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w -X main.Version={{.Version}}
+
+archives:
+  - id: nistru
+    ids:
+      - nistru
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  prerelease: auto
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - '^ci:'
+
+brews:
+  - name: nistru
+    ids:
+      - nistru
+    repository:
+      owner: savimcio
+      name: homebrew-tap
+      branch: main
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/savimcio/nistru"
+    description: "A minimal terminal text editor with a file-tree sidebar, modal vim-style editing, micro-inspired Ctrl shortcuts, and a plugin system for formatters, linters, and custom panes."
+    license: "MIT"
+    skip_upload: auto
+    test: |
+      system "#{bin}/nistru", "--version"
+
+nfpms:
+  - id: nistru
+    package_name: nistru
+    ids:
+      - nistru
+    vendor: savimcio
+    homepage: "https://github.com/savimcio/nistru"
+    maintainer: "savimcio <noreply@users.noreply.github.com>"
+    description: "A minimal terminal text editor with a file-tree sidebar, modal vim-style editing, micro-inspired Ctrl shortcuts, and a plugin system for formatters, linters, and custom panes."
+    license: "MIT"
+    formats:
+      - deb
+      - rpm

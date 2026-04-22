@@ -1,4 +1,4 @@
-.PHONY: test test-short race cover lint fuzz e2e ci fmt clean examples-test build
+.PHONY: test test-short race cover lint fuzz e2e ci fmt clean examples-test build release-check release-snapshot
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
@@ -51,3 +51,9 @@ fmt:
 clean:
 	rm -f coverage.out coverage.html
 	rm -rf bin
+
+release-check:
+	goreleaser check
+
+release-snapshot:
+	goreleaser release --snapshot --clean --skip=publish
