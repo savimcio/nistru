@@ -32,7 +32,7 @@ func TestNewModelEmitsInitializeAndRegistersAutoupdateCommands(t *testing.T) {
 
 	root := t.TempDir()
 
-	m, err := NewModel(root)
+	m, err := NewModel(root, nil)
 	if err != nil {
 		t.Fatalf("NewModel(%q): %v", root, err)
 	}

@@ -7,6 +7,7 @@
 package treepane
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,14 +18,21 @@ import (
 	"github.com/savimcio/nistru/plugin"
 )
 
-// skipDirs is the hardcoded list of directory names we refuse to descend into.
-// Anything hidden (prefix ".") is also skipped except the root itself.
-var skipDirs = map[string]struct{}{
-	".git":         {},
-	"node_modules": {},
-	"vendor":       {},
-	"dist":         {},
-	"build":        {},
+// defaultSkipDirs is the baseline list of directory names we refuse to descend
+// into when no [plugins.treepane].skip_dirs override is supplied. Anything
+// hidden (prefix ".") is also skipped except the root itself. This list is
+// the in-code source of truth mirrored by the commented example in the
+// [plugins.treepane] skeleton — keep the two in sync.
+var defaultSkipDirs = []string{".git", "node_modules", "vendor", "dist", "build"}
+
+// makeSkipSet turns a slice of directory names into the set form walkDir
+// expects. Empty slice yields an empty set (nothing gets filtered by name).
+func makeSkipSet(dirs []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(dirs))
+	for _, d := range dirs {
+		out[d] = struct{}{}
+	}
+	return out
 }
 
 // row is one fully pre-rendered line of the tree. `prefix` contains the
@@ -50,13 +58,15 @@ type fsNode struct {
 
 // buildFsTree walks the directory at root and returns the fully constructed
 // fsNode tree. Every real directory starts collapsed; the synthetic top-level
-// wrapper is expanded so its children are visible at launch.
-func buildFsTree(root string) (*fsNode, error) {
+// wrapper is expanded so its children are visible at launch. The skip argument
+// is the per-invocation set of directory basenames to skip; pass nil to skip
+// nothing (hidden entries are still filtered by the walker itself).
+func buildFsTree(root string, skip map[string]struct{}) (*fsNode, error) {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, err
 	}
-	children, err := walkDir(absRoot, true)
+	children, err := walkDir(absRoot, true, skip)
 	if err != nil {
 		return nil, err
 	}
@@ -73,10 +83,13 @@ func buildFsTree(root string) (*fsNode, error) {
 
 // walkDir reads dir and returns its children as *fsNode values. isRoot tells
 // us whether to honour the "skip hidden" rule (we always descend into the
-// root even if its own name starts with "."). Errors for individual entries
-// are swallowed silently — a read-protected sub-tree shouldn't bring the UI
-// down — but errors on the top-level read are propagated.
-func walkDir(dir string, isRoot bool) ([]*fsNode, error) {
+// root even if its own name starts with "."). skip is the per-invocation set
+// of basenames to filter out — passed as a parameter rather than read from a
+// package-level var so the pane can honour user-supplied overrides on reload.
+// Errors for individual entries are swallowed silently — a read-protected
+// sub-tree shouldn't bring the UI down — but errors on the top-level read are
+// propagated.
+func walkDir(dir string, isRoot bool, skip map[string]struct{}) ([]*fsNode, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if isRoot {
@@ -89,7 +102,7 @@ func walkDir(dir string, isRoot bool) ([]*fsNode, error) {
 	var dirs, files []os.DirEntry
 	for _, e := range entries {
 		name := e.Name()
-		if _, skip := skipDirs[name]; skip {
+		if _, dropped := skip[name]; dropped {
 			continue
 		}
 		if strings.HasPrefix(name, ".") {
@@ -114,7 +127,7 @@ func walkDir(dir string, isRoot bool) ([]*fsNode, error) {
 
 	nodes := make([]*fsNode, 0, len(dirs)+len(files))
 	for _, d := range dirs {
-		sub, _ := walkDir(filepath.Join(dir, d.Name()), false)
+		sub, _ := walkDir(filepath.Join(dir, d.Name()), false, skip)
 		nodes = append(nodes, &fsNode{
 			path:     filepath.Join(dir, d.Name()),
 			label:    d.Name(),
@@ -508,25 +521,31 @@ func truncateToWidth(s string, width int) string {
 // TreePane is the exported wrapper that implements both plugin.Plugin and
 // plugin.Pane. It owns a treeModel and forwards pane lifecycle calls into it
 // while translating transport-neutral KeyEvents into the string keys that
-// treeModel.Update expects.
+// treeModel.Update expects. skipDirs is the currently-effective set of
+// directory basenames to filter from the walker — initialized from
+// defaultSkipDirs and rewritten by OnConfig.
 type TreePane struct {
-	model   treeModel
-	root    string
-	w, h    int
-	focused bool
+	model    treeModel
+	root     string
+	skipDirs map[string]struct{}
+	w, h     int
+	focused  bool
 }
 
 // New constructs a TreePane rooted at rootPath. It builds the full filesystem
 // tree eagerly, matching the previous behavior. Returns an error if the root
-// directory cannot be read.
+// directory cannot be read. The initial skip set is defaultSkipDirs; a later
+// OnConfig may replace it.
 func New(rootPath string) (*TreePane, error) {
-	node, err := buildFsTree(rootPath)
+	skip := makeSkipSet(defaultSkipDirs)
+	node, err := buildFsTree(rootPath, skip)
 	if err != nil {
 		return nil, err
 	}
 	return &TreePane{
-		model: newTreeModel(node, 1, 1),
-		root:  rootPath,
+		model:    newTreeModel(node, 1, 1),
+		root:     rootPath,
+		skipDirs: skip,
 	}, nil
 }
 
@@ -538,8 +557,80 @@ func (p *TreePane) Name() string { return "treepane" }
 // with the wire protocol.
 func (p *TreePane) Activation() []string { return []string{"onStart"} }
 
-// OnEvent is a no-op in v1; the tree does not react to buffer events.
-func (p *TreePane) OnEvent(event any) []plugin.Effect { return nil }
+// OnEvent is a no-op in v1 for most events; the tree does not react to buffer
+// events. Initialize is the one exception — it's the signal that config has
+// settled and any skip_dirs change from OnConfig should be materialised into
+// the on-screen tree.
+func (p *TreePane) OnEvent(event any) []plugin.Effect {
+	if _, ok := event.(plugin.Initialize); ok {
+		p.rebuildTree()
+	}
+	return nil
+}
+
+// OnConfig is the plugin.ConfigReceiver entrypoint. The host calls it just
+// before Initialize on first activation and again on every reload. We accept
+// a single optional key:
+//
+//	[plugins.treepane]
+//	skip_dirs = [".git", "dist"]   # absent -> reset to defaults; [] -> skip nothing
+//
+// The contract is "OnConfig represents the effective config at this moment".
+// If skip_dirs is absent — whether because the whole [plugins.treepane]
+// section was removed (raw is nil/empty) or only the skip_dirs line was
+// deleted from an otherwise-present section (raw is non-nil but the key is
+// absent) — the skip set resets to defaultSkipDirs. This matches the
+// ConfigReceiver nil-raw contract documented on plugin.ConfigReceiver and
+// ensures users who delete config see the in-code defaults return rather
+// than stale state from a previous load.
+//
+// The rebuild is deferred to the following OnEvent(Initialize) because that's
+// where the host's reload path normally drives UI refresh; doing it here as
+// well would rebuild twice on first boot.
+func (p *TreePane) OnConfig(raw json.RawMessage) error {
+	if len(raw) == 0 {
+		// Config section absent entirely — reset to the in-code defaults.
+		p.skipDirs = makeSkipSet(defaultSkipDirs)
+		return nil
+	}
+	var cfg struct {
+		SkipDirs *[]string `json:"skip_dirs"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return err
+	}
+	if cfg.SkipDirs == nil {
+		// Key absent from an otherwise-present section — treat as "no
+		// override", which means the baseline defaults apply.
+		p.skipDirs = makeSkipSet(defaultSkipDirs)
+		return nil
+	}
+	// Explicit value supplied (possibly an empty array, meaning "skip
+	// nothing"). Replace the skip set; the following OnEvent(Initialize) will
+	// rebuild the tree against the new set.
+	p.skipDirs = makeSkipSet(*cfg.SkipDirs)
+	return nil
+}
+
+// rebuildTree reconstructs the fsNode tree from disk using the plugin's
+// current skip set and swaps it into the underlying treeModel. Errors are
+// swallowed — a transient read failure should not leave the pane with a nil
+// root. The treeModel's size is preserved so the repaint lines up with the
+// existing viewport.
+func (p *TreePane) rebuildTree() {
+	node, err := buildFsTree(p.root, p.skipDirs)
+	if err != nil {
+		return
+	}
+	w, h := p.w, p.h
+	if w < 1 {
+		w = 1
+	}
+	if h < 1 {
+		h = 1
+	}
+	p.model = newTreeModel(node, w, h)
+}
 
 // Shutdown releases resources. The tree has none.
 func (p *TreePane) Shutdown() error { return nil }

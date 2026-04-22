@@ -99,6 +99,44 @@ The editor is modal. It opens in **Normal** mode (cursor navigation). Press `i`,
 
 Autosave is enabled by default. After any buffer change, a 250 ms idle debounce schedules a write; rapid typing produces exactly one write when typing stops. Writes are atomic (write to `<path>.tmp`, then rename over the original), so a killed process never leaves a half-written file. The right side of the status bar shows `● unsaved` while dirty and `✓ saved` for about a second after each flush. A size guard refuses to open files larger than 1 MiB, and binary files are refused if a NUL byte appears in the first 512 bytes.
 
+## Configuration
+
+Nistru reads layered TOML from two files. Lowest-priority wins first:
+
+1. Built-in defaults.
+2. `~/.config/nistru/config.toml` — user-wide.
+3. `<root>/.nistru/config.toml` — project-local (overrides user).
+4. `NISTRU_*` environment variables — emergency override.
+
+Missing files are not errors; malformed TOML is reported as a startup warning on stderr. See [internal/config/](internal/config/) for the schema.
+
+Minimal example:
+
+```toml
+[ui]
+tree_width = 40
+
+[autosave]
+save_debounce = "500ms"
+
+[plugins.autoupdate]
+channel  = "dev"
+interval = "30m"
+```
+
+Four palette commands (`Ctrl+P`) manage settings:
+
+| Command | Action |
+|---|---|
+| `Nistru: Open User Settings` | open `~/.config/nistru/config.toml` (seeded with commented defaults if absent) |
+| `Nistru: Open Project Settings` | open `<root>/.nistru/config.toml` (seeded if absent) |
+| `Nistru: Reload Settings` | reparse both files, re-emit `Initialize` to activated plugins |
+| `Nistru: Show Resolved Config` | dump the fully-merged config to `<root>/.nistru/.resolved-config.toml` and open it |
+
+**Reload behaviour.** `Nistru: Reload Settings` takes effect immediately for app-level keybindings (save/quit/palette/focus), UI sizes (tree width, status fade), debounces, and plugin config (`OnConfig` is re-fired on every activated plugin). The in-editor Ctrl bindings (`ctrl+z`/`y`/`x`/`c`/`v`) and the `ui.relative_numbers` flag are baked into the underlying vim component at editor-instance construction time; when any of them changes on reload, the editor instance is rebuilt in place so the new setting is in effect without opening another file. Buffer content and the open file are preserved across the rebuild, but cursor position and vim mode reset to the top of the file in Normal mode.
+
+**Keymap unbinding.** Setting a keybinding to the empty string (e.g. `save = ""`) falls back to the default binding; there is no way to fully unbind an action today.
+
 ## Auto-update
 
 Nistru ships with a first-party `autoupdate` plugin that watches GitHub Releases for newer versions. It is enabled by default, runs quietly in the background, and never swaps the binary without explicit palette invocation.

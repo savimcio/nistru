@@ -17,6 +17,8 @@ package autoupdate
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -39,11 +41,22 @@ const (
 	shutdownGrace = 500 * time.Millisecond
 
 	// envRepo, envChannel, envInterval, envDisable are the environment-
-	// variable overrides honoured by New().
-	envRepo     = "NISTRU_AUTOUPDATE_REPO"
-	envChannel  = "NISTRU_AUTOUPDATE_CHANNEL"
+	// variable overrides honoured by handleInitialize. They sit above config
+	// but below constructor options in the precedence ladder so shell-side
+	// overrides remain an emergency kill switch.
+	//
+	// Deprecated: prefer the [plugins.autoupdate] TOML section. Env still wins
+	// as an emergency override.
+	envRepo = "NISTRU_AUTOUPDATE_REPO"
+	// Deprecated: prefer the [plugins.autoupdate] TOML section. Env still wins
+	// as an emergency override.
+	envChannel = "NISTRU_AUTOUPDATE_CHANNEL"
+	// Deprecated: prefer the [plugins.autoupdate] TOML section. Env still wins
+	// as an emergency override.
 	envInterval = "NISTRU_AUTOUPDATE_INTERVAL"
-	envDisable  = "NISTRU_AUTOUPDATE_DISABLE"
+	// Deprecated: prefer the [plugins.autoupdate] TOML section. Env still wins
+	// as an emergency override.
+	envDisable = "NISTRU_AUTOUPDATE_DISABLE"
 )
 
 // Installer is the seam T7 will fill with the real binary swap. The noop
@@ -64,6 +77,19 @@ type Plugin struct {
 	interval time.Duration
 	disabled bool
 
+	// optionSet records which fields were explicitly set via constructor
+	// options. OnConfig and applyEnv honour this bitset so options remain
+	// the highest-precedence source.
+	optionSet sourceBits
+
+	// configSet records which fields currently carry a value installed by a
+	// prior OnConfig call. On reload with nil/empty raw (the user removed
+	// the [plugins.autoupdate] section), OnConfig uses this set to know
+	// exactly which fields to revert to defaults, leaving option- and
+	// env-owned fields alone. Writes gated by p.mu like every other mutable
+	// field on this struct.
+	configSet sourceBits
+
 	client    *http.Client
 	installer Installer
 	now       func() time.Time
@@ -78,12 +104,24 @@ type Plugin struct {
 	ctxCancel context.CancelFunc
 }
 
+// sourceBits tracks which fields were set via constructor options. Precedence
+// (low → high): defaults → config (OnConfig) → env (applyEnv) → options.
+// A true bit means the field was set by an option; config and env leave it
+// alone.
+type sourceBits struct {
+	repo, channel, interval, disabled bool
+}
+
 // Option configures Plugin at construction.
 type Option func(*Plugin)
 
-// WithRepo overrides the "owner/repo" string polled for releases.
+// WithRepo overrides the "owner/repo" string polled for releases. Marks the
+// field as option-owned so OnConfig and env vars cannot overwrite it.
 func WithRepo(repo string) Option {
-	return func(p *Plugin) { p.repo = repo }
+	return func(p *Plugin) {
+		p.repo = repo
+		p.optionSet.repo = true
+	}
 }
 
 // WithHTTPClient injects a custom *http.Client (tests point it at an
@@ -109,11 +147,13 @@ func WithClock(now func() time.Time) Option {
 }
 
 // WithInterval overrides the ticker period. Tests use very short intervals
-// to exercise the loop without hanging.
+// to exercise the loop without hanging. Marks the field as option-owned so
+// OnConfig and env vars cannot overwrite it.
 func WithInterval(d time.Duration) Option {
 	return func(p *Plugin) {
 		if d > 0 {
 			p.interval = d
+			p.optionSet.interval = true
 		}
 	}
 }
@@ -143,10 +183,12 @@ func WithVersionFunc(fn func() string) Option {
 	}
 }
 
-// New returns a configured plugin with defaults filled in from the
-// environment. Env precedence: construction options > env vars > package
-// defaults. New never performs I/O; the background goroutine and state load
-// run inside OnEvent(Initialize).
+// New returns a configured plugin with defaults plus any supplied options
+// applied. Precedence (low → high) is: defaults → config (via OnConfig) →
+// env vars (applied in handleInitialize) → constructor options. Env and
+// config reads are deferred until handleInitialize so options always win
+// over both. New never performs I/O; the background goroutine and state
+// load run inside OnEvent(Initialize).
 func New(opts ...Option) *Plugin {
 	p := &Plugin{
 		name:     "autoupdate",
@@ -158,28 +200,164 @@ func New(opts ...Option) *Plugin {
 	}
 	p.installer = NewInstaller(WithStateUpdater(p.updateState))
 
-	// Env defaults are applied before explicit options so callers can still
-	// override them. Tests that want a deterministic environment should
-	// clear these vars via t.Setenv before constructing.
-	if v := strings.TrimSpace(os.Getenv(envRepo)); v != "" {
-		p.repo = v
-	}
-	if v := strings.TrimSpace(os.Getenv(envChannel)); v != "" {
-		p.channel = v
-	}
-	if v := strings.TrimSpace(os.Getenv(envInterval)); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			p.interval = d
-		}
-	}
-	if os.Getenv(envDisable) == "1" {
-		p.disabled = true
-	}
-
 	for _, opt := range opts {
 		opt(p)
 	}
 	return p
+}
+
+// OnConfig applies config values to any field not already set via a
+// constructor option. Env vars still win: they are applied after OnConfig
+// in handleInitialize. Safe to call before or after handleInitialize; if
+// called after, fields changed here only take effect on the next check.
+//
+// Nil/empty-raw reset: when raw is nil or zero-length, the plugin was
+// reloaded with [plugins.autoupdate] absent from config. Any field that was
+// previously set by OnConfig (tracked in p.configSet) is reverted to its
+// construction-time default, so removing config cleanly restores defaults
+// without leaking stale overrides into the next check. Fields set via
+// constructor options or env vars are left untouched — they sit higher in
+// the precedence ladder and OnConfig never owned them.
+func (p *Plugin) OnConfig(raw json.RawMessage) error {
+	if len(raw) == 0 {
+		p.resetConfigFields()
+		return nil
+	}
+	// Shape is intentionally loose: unknown fields are ignored silently so
+	// future keys don't break older plugins.
+	var cfg struct {
+		Repo     *string `json:"repo,omitempty"`
+		Channel  *string `json:"channel,omitempty"`
+		Interval *string `json:"interval,omitempty"`
+		Disable  *bool   `json:"disable,omitempty"`
+	}
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return err
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	// For each field, track whether this call installed a value. A field
+	// whose key is absent from the current raw reverts to its default if a
+	// prior OnConfig had set it — mirroring the nil-raw reset path but
+	// scoped to just that field.
+	if p.optionSet.repo {
+		// Option-owned; OnConfig has no say.
+	} else if cfg.Repo != nil {
+		if v := strings.TrimSpace(*cfg.Repo); v != "" {
+			p.repo = v
+			p.configSet.repo = true
+		} else if p.configSet.repo {
+			// Empty/whitespace value after previously setting via config —
+			// treat as a reset so users can clear a stale override by
+			// writing repo = "" without deleting the whole section.
+			p.repo = defaultRepo
+			p.configSet.repo = false
+		}
+	} else if p.configSet.repo {
+		p.repo = defaultRepo
+		p.configSet.repo = false
+	}
+
+	if p.optionSet.channel {
+		// Option-owned.
+	} else if cfg.Channel != nil {
+		p.channel = strings.TrimSpace(*cfg.Channel)
+		p.configSet.channel = true
+	} else if p.configSet.channel {
+		p.channel = ""
+		p.configSet.channel = false
+	}
+
+	if p.optionSet.interval {
+		// Option-owned.
+	} else if cfg.Interval != nil {
+		s := strings.TrimSpace(*cfg.Interval)
+		if s != "" {
+			if d, err := time.ParseDuration(s); err == nil && d > 0 {
+				p.interval = d
+				p.configSet.interval = true
+			} else {
+				fmt.Fprintf(os.Stderr, "plugin/autoupdate: bad interval %q in config: %v\n", s, err)
+			}
+		}
+	} else if p.configSet.interval {
+		p.interval = defaultInterval
+		p.configSet.interval = false
+	}
+
+	if p.optionSet.disabled {
+		// Option-owned.
+	} else if cfg.Disable != nil {
+		p.disabled = *cfg.Disable
+		p.configSet.disabled = true
+	} else if p.configSet.disabled {
+		p.disabled = false
+		p.configSet.disabled = false
+	}
+	return nil
+}
+
+// resetConfigFields reverts every field currently flagged as config-owned
+// (p.configSet) back to its construction-time default, leaving option- and
+// env-owned fields untouched. Called from OnConfig when raw is nil/empty,
+// which signals that the [plugins.autoupdate] section was removed on reload.
+// Constants like defaultRepo and defaultInterval are the source of truth;
+// the empty channel and disabled=false match what New() installs before
+// options are applied.
+func (p *Plugin) resetConfigFields() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.configSet.repo && !p.optionSet.repo {
+		p.repo = defaultRepo
+	}
+	if p.configSet.channel && !p.optionSet.channel {
+		p.channel = ""
+	}
+	if p.configSet.interval && !p.optionSet.interval {
+		p.interval = defaultInterval
+	}
+	if p.configSet.disabled && !p.optionSet.disabled {
+		p.disabled = false
+	}
+	// Clear the bits regardless of option ownership — a field we could not
+	// reset is one that the option layer now owns anyway, and leaving the
+	// bit set would cause the next OnConfig to double-reset it.
+	p.configSet = sourceBits{}
+}
+
+// applyEnv reads the deprecated NISTRU_AUTOUPDATE_* env vars and overlays
+// them onto any field that was not set via a constructor option. Called at
+// the start of handleInitialize so env always wins over OnConfig but loses
+// to options. Callers must not hold p.mu — this helper acquires it.
+func applyEnv(p *Plugin) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.optionSet.repo {
+		if v := strings.TrimSpace(os.Getenv(envRepo)); v != "" {
+			p.repo = v
+		}
+	}
+	if !p.optionSet.channel {
+		if v := strings.TrimSpace(os.Getenv(envChannel)); v != "" {
+			p.channel = v
+		}
+	}
+	if !p.optionSet.interval {
+		if v := strings.TrimSpace(os.Getenv(envInterval)); v != "" {
+			if d, err := time.ParseDuration(v); err == nil && d > 0 {
+				p.interval = d
+			}
+		}
+	}
+	if !p.optionSet.disabled {
+		if os.Getenv(envDisable) == "1" {
+			p.disabled = true
+		}
+	}
 }
 
 // Name implements plugin.Plugin.
@@ -228,7 +406,22 @@ func (p *Plugin) Shutdown() error {
 // register commands (so the palette surfaces them and users can dispatch
 // install/rollback manually), but skip the background checker — "disabled"
 // refers to the polling loop, not the whole feature.
+//
+// applyEnv runs first so env vars overlay whatever OnConfig (fired earlier
+// from the host's Initialize dispatch) installed. Constructor options stay
+// untouched because the optionSet bits gate every write.
 func (p *Plugin) handleInitialize() {
+	applyEnv(p)
+
+	// Idempotency: handleInitialize may fire a second time after a settings
+	// reload (Host.ReEmitInitialize). Stop any prior checker goroutine before
+	// we potentially spawn a new one so reloads do not leak goroutines, and
+	// so a user flipping [plugins.autoupdate].disable = true in config then
+	// reloading actually silences the background poller. stopCheckerForReload
+	// does not flip p.shutdown — that is reserved for the permanent-shutdown
+	// path — so the re-spawn below still runs.
+	p.stopCheckerForReload()
+
 	p.mu.Lock()
 	if p.shutdown {
 		p.mu.Unlock()
@@ -594,6 +787,8 @@ func (p *Plugin) stopChecker() {
 	p.shutdown = true
 	cancel := p.ctxCancel
 	c := p.checker
+	p.checker = nil
+	p.ctxCancel = nil
 	inst := p.installer
 	p.mu.Unlock()
 
@@ -610,6 +805,35 @@ func (p *Plugin) stopChecker() {
 	}
 }
 
+// stopCheckerForReload cancels the background goroutine and waits for it to
+// exit (up to shutdownGrace) without flipping p.shutdown. Used from
+// handleInitialize to guarantee idempotency under Host.ReEmitInitialize so
+// a settings reload never leaks a goroutine or keeps a stale poller alive
+// after the user flipped [plugins.autoupdate].disable = true.
+//
+// Safe to call when no checker has ever been spawned — it is a no-op in
+// that case. Does not invoke the installer's Cleanup hook because this
+// path is not a permanent shutdown.
+func (p *Plugin) stopCheckerForReload() {
+	p.mu.Lock()
+	if p.shutdown {
+		p.mu.Unlock()
+		return
+	}
+	cancel := p.ctxCancel
+	c := p.checker
+	p.checker = nil
+	p.ctxCancel = nil
+	p.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if c != nil {
+		c.cancel(shutdownGrace)
+	}
+}
+
 // cleaner is the optional interface RealInstaller implements so the plugin
 // can garbage-collect stale ".prev" binaries on Shutdown.
 type cleaner interface {
@@ -618,6 +842,7 @@ type cleaner interface {
 
 // Compile-time assertions so a missing interface surfaces at build time.
 var (
-	_ plugin.Plugin    = (*Plugin)(nil)
-	_ plugin.HostAware = (*Plugin)(nil)
+	_ plugin.Plugin         = (*Plugin)(nil)
+	_ plugin.HostAware      = (*Plugin)(nil)
+	_ plugin.ConfigReceiver = (*Plugin)(nil)
 )

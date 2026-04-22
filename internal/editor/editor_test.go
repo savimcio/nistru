@@ -51,7 +51,7 @@ type setModeSentinel struct {
 
 func TestAddCtrlBindings_RegistersFiveKeysAcrossThreeModes(t *testing.T) {
 	rec := &recordingEditor{}
-	addCtrlBindings(rec)
+	addCtrlBindings(rec, nil)
 
 	wantKeys := []string{"ctrl+z", "ctrl+y", "ctrl+x", "ctrl+c", "ctrl+v"}
 	wantModes := []vimtea.EditorMode{vimtea.ModeNormal, vimtea.ModeInsert, vimtea.ModeVisual}

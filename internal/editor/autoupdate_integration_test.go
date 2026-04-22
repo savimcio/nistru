@@ -113,7 +113,7 @@ func TestAutoupdatePluginEndToEnd(t *testing.T) {
 	)
 	registry.RegisterInProc(au)
 
-	m, err := newModelWithRegistry(root, registry)
+	m, err := newModelWithRegistry(root, registry, nil)
 	if err != nil {
 		t.Fatalf("newModelWithRegistry: %v", err)
 	}

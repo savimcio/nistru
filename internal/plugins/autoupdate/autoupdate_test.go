@@ -2,6 +2,7 @@ package autoupdate
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -287,6 +288,365 @@ func TestExecuteInstallCallsInstaller(t *testing.T) {
 		defer inst.mu.Unlock()
 		return inst.rollbacks == 1
 	})
+}
+
+// TestPlugin_ConfigPrecedence exercises the three-way precedence ladder for
+// the autoupdate plugin's configuration sources: defaults < config (via
+// OnConfig) < env < constructor options.
+//
+// Every case drives the same flow: build a Plugin, optionally set env and/or
+// call OnConfig, then run handleInitialize (which applies env). The final
+// field values on p are the ground truth. A disabled checker (or a stub
+// HTTP transport + a tempdir state path) keeps these tests hermetic — the
+// background goroutine must not hit the network or leak past t.Cleanup.
+func TestPlugin_ConfigPrecedence(t *testing.T) {
+	type fields struct {
+		repo     string
+		channel  string
+		interval time.Duration
+		disabled bool
+	}
+
+	cases := []struct {
+		name      string
+		envRepo   string // "" means leave unset
+		envChan   string
+		envIntvl  string
+		envDis    string
+		config    string // raw JSON for OnConfig; "" means skip
+		extraOpts func(t *testing.T) []Option
+		want      fields
+	}{
+		{
+			name:   "config_alone",
+			config: `{"repo":"c/r","channel":"dev","interval":"2h","disable":true}`,
+			want: fields{
+				repo:     "c/r",
+				channel:  "dev",
+				interval: 2 * time.Hour,
+				disabled: true,
+			},
+		},
+		{
+			name:    "env_wins_over_config",
+			envRepo: "env/r",
+			config:  `{"repo":"cfg/r"}`,
+			want: fields{
+				repo:     "env/r",
+				channel:  "",
+				interval: defaultInterval,
+				disabled: false,
+			},
+		},
+		{
+			name:    "option_wins_over_both",
+			envRepo: "env/r",
+			config:  `{"repo":"cfg/r"}`,
+			extraOpts: func(_ *testing.T) []Option {
+				return []Option{WithRepo("opt/r")}
+			},
+			want: fields{
+				repo:     "opt/r",
+				channel:  "",
+				interval: defaultInterval,
+				disabled: false,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Scrub env so parallel/serial runs are hermetic; then set per-case.
+			t.Setenv(envRepo, tc.envRepo)
+			t.Setenv(envChannel, tc.envChan)
+			t.Setenv(envInterval, tc.envIntvl)
+			t.Setenv(envDisable, tc.envDis)
+
+			// Stub transport so the checker goroutine doesn't try the real
+			// network even when the config doesn't disable it. An empty
+			// JSON array is a valid /releases payload.
+			client := &http.Client{
+				Transport: &stubTransport{body: []byte(`[]`)},
+				Timeout:   5 * time.Second,
+			}
+
+			statePath := filepath.Join(t.TempDir(), "s.json")
+			opts := []Option{
+				WithHTTPClient(client),
+				WithStatePath(statePath),
+				WithCurrent("v0.1.0"),
+			}
+			if tc.extraOpts != nil {
+				opts = append(opts, tc.extraOpts(t)...)
+			}
+
+			p := New(opts...)
+			// Teardown first so a half-initialised plugin still stops cleanly.
+			t.Cleanup(func() { _ = p.Shutdown() })
+
+			if tc.config != "" {
+				if err := p.OnConfig(json.RawMessage(tc.config)); err != nil {
+					t.Fatalf("OnConfig: %v", err)
+				}
+			}
+
+			// Drive env application + (possibly) checker spawn. The stub
+			// transport + tempdir state path keep it hermetic.
+			p.handleInitialize()
+
+			p.mu.Lock()
+			got := fields{
+				repo:     p.repo,
+				channel:  p.channel,
+				interval: p.interval,
+				disabled: p.disabled,
+			}
+			p.mu.Unlock()
+
+			if got != tc.want {
+				t.Fatalf("fields = %+v, want %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPlugin_Initialize_Idempotent verifies that a second handleInitialize
+// call — as happens after Host.ReEmitInitialize on a settings reload — does
+// not leak the previous checker goroutine. The earlier checker must be
+// cancelled and its goroutine exited before the new one spawns.
+func TestPlugin_Initialize_Idempotent(t *testing.T) {
+	srv, _ := newReleaseServerJSON(t, `[]`)
+	p := newTestPlugin(t, srv, "v0.1.0")
+	_ = newTestHost(t, p)
+
+	// First init: spawns checker #1.
+	_ = p.OnEvent(plugin.Initialize{RootPath: t.TempDir()})
+	p.mu.Lock()
+	first := p.checker
+	p.mu.Unlock()
+	if first == nil {
+		t.Fatalf("first handleInitialize did not spawn a checker")
+	}
+
+	// Second init: must stop checker #1 and spawn checker #2. We wait on
+	// first.done to prove the goroutine actually exited — a leak would
+	// show up as this channel never closing.
+	_ = p.OnEvent(plugin.Initialize{RootPath: t.TempDir()})
+	select {
+	case <-first.done:
+	case <-time.After(2 * shutdownGrace):
+		t.Fatalf("prior checker goroutine did not exit after re-initialize")
+	}
+
+	p.mu.Lock()
+	second := p.checker
+	p.mu.Unlock()
+	if second == nil {
+		t.Fatalf("second handleInitialize did not spawn a fresh checker")
+	}
+	if second == first {
+		t.Fatalf("second handleInitialize reused the stopped checker pointer")
+	}
+
+	// Shutdown must cleanly stop checker #2 and leave p.checker nil.
+	if err := p.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case <-second.done:
+	case <-time.After(2 * shutdownGrace):
+		t.Fatalf("current checker goroutine did not exit on Shutdown")
+	}
+	p.mu.Lock()
+	leaked := p.checker
+	p.mu.Unlock()
+	if leaked != nil {
+		t.Fatalf("Shutdown did not clear p.checker; got %p", leaked)
+	}
+}
+
+// TestPlugin_Initialize_Idempotent_DisabledAfterReload verifies the second
+// fix motivation: if the user flips `disable = true` in config and reloads,
+// the old checker is stopped and no new one is spawned.
+func TestPlugin_Initialize_Idempotent_DisabledAfterReload(t *testing.T) {
+	srv, _ := newReleaseServerJSON(t, `[]`)
+	p := newTestPlugin(t, srv, "v0.1.0")
+	_ = newTestHost(t, p)
+
+	_ = p.OnEvent(plugin.Initialize{RootPath: t.TempDir()})
+	p.mu.Lock()
+	first := p.checker
+	p.mu.Unlock()
+	if first == nil {
+		t.Fatalf("first handleInitialize did not spawn a checker")
+	}
+
+	// Simulate a reload where config now disables the poller.
+	if err := p.OnConfig(json.RawMessage(`{"disable":true}`)); err != nil {
+		t.Fatalf("OnConfig: %v", err)
+	}
+	_ = p.OnEvent(plugin.Initialize{RootPath: t.TempDir()})
+
+	select {
+	case <-first.done:
+	case <-time.After(2 * shutdownGrace):
+		t.Fatalf("prior checker goroutine did not exit after disable+reload")
+	}
+	p.mu.Lock()
+	stillRunning := p.checker
+	p.mu.Unlock()
+	if stillRunning != nil {
+		t.Fatalf("checker still running after disable=true reload: %p", stillRunning)
+	}
+}
+
+// TestPlugin_OnConfig_Nil_ResetsConfigFields covers the Host.ReEmitInitialize
+// reload path where a user has removed the [plugins.autoupdate] section
+// entirely: the host now invokes OnConfig(nil) and the plugin must revert
+// every field previously set via config back to its construction-time
+// default, leaving option- and env-owned fields alone.
+func TestPlugin_OnConfig_Nil_ResetsConfigFields(t *testing.T) {
+	// Scrub env so this test is hermetic — env vars would otherwise pin
+	// fields above the config layer and defeat the reset check.
+	t.Setenv(envDisable, "")
+	t.Setenv(envRepo, "")
+	t.Setenv(envChannel, "")
+	t.Setenv(envInterval, "")
+
+	p := New()
+	t.Cleanup(func() { _ = p.Shutdown() })
+
+	// Seed repo+interval+channel+disable via config; the field values should
+	// then reflect the config payload.
+	payload := `{"repo":"x/y","channel":"dev","interval":"2h","disable":true}`
+	if err := p.OnConfig(json.RawMessage(payload)); err != nil {
+		t.Fatalf("OnConfig(payload): %v", err)
+	}
+	p.mu.Lock()
+	gotRepo := p.repo
+	gotChan := p.channel
+	gotIntvl := p.interval
+	gotDis := p.disabled
+	p.mu.Unlock()
+	if gotRepo != "x/y" {
+		t.Fatalf("after payload, repo = %q, want x/y", gotRepo)
+	}
+	if gotChan != "dev" {
+		t.Fatalf("after payload, channel = %q, want dev", gotChan)
+	}
+	if gotIntvl != 2*time.Hour {
+		t.Fatalf("after payload, interval = %s, want 2h", gotIntvl)
+	}
+	if !gotDis {
+		t.Fatalf("after payload, disabled = false, want true")
+	}
+
+	// Now the user deletes [plugins.autoupdate] and reloads; the host calls
+	// OnConfig(nil). Every field the prior OnConfig wrote must revert to
+	// its construction-time default.
+	if err := p.OnConfig(nil); err != nil {
+		t.Fatalf("OnConfig(nil): %v", err)
+	}
+	p.mu.Lock()
+	gotRepo = p.repo
+	gotChan = p.channel
+	gotIntvl = p.interval
+	gotDis = p.disabled
+	p.mu.Unlock()
+	if gotRepo != defaultRepo {
+		t.Fatalf("after OnConfig(nil), repo = %q, want %q", gotRepo, defaultRepo)
+	}
+	if gotChan != "" {
+		t.Fatalf("after OnConfig(nil), channel = %q, want empty", gotChan)
+	}
+	if gotIntvl != defaultInterval {
+		t.Fatalf("after OnConfig(nil), interval = %s, want %s", gotIntvl, defaultInterval)
+	}
+	if gotDis {
+		t.Fatalf("after OnConfig(nil), disabled = true, want false")
+	}
+
+	// Zero-length raw (json.RawMessage{}) must take the same reset path.
+	if err := p.OnConfig(json.RawMessage(payload)); err != nil {
+		t.Fatalf("OnConfig(restore): %v", err)
+	}
+	if err := p.OnConfig(json.RawMessage{}); err != nil {
+		t.Fatalf("OnConfig(empty): %v", err)
+	}
+	p.mu.Lock()
+	gotRepo = p.repo
+	gotDis = p.disabled
+	p.mu.Unlock()
+	if gotRepo != defaultRepo {
+		t.Fatalf("after OnConfig(empty), repo = %q, want %q", gotRepo, defaultRepo)
+	}
+	if gotDis {
+		t.Fatalf("after OnConfig(empty), disabled = true, want false")
+	}
+}
+
+// TestPlugin_OnConfig_Nil_LeavesOptionsAlone asserts the reset path respects
+// the precedence ladder: fields set via constructor options must not be
+// overwritten by the nil-raw reset.
+func TestPlugin_OnConfig_Nil_LeavesOptionsAlone(t *testing.T) {
+	t.Setenv(envDisable, "")
+	t.Setenv(envRepo, "")
+	t.Setenv(envChannel, "")
+	t.Setenv(envInterval, "")
+
+	p := New(WithRepo("opt/repo"), WithInterval(3*time.Hour))
+	t.Cleanup(func() { _ = p.Shutdown() })
+
+	// Config tries to override both, but options win.
+	if err := p.OnConfig(json.RawMessage(`{"repo":"cfg/r","interval":"5h"}`)); err != nil {
+		t.Fatalf("OnConfig: %v", err)
+	}
+	// Now remove config: option-owned fields must stay put.
+	if err := p.OnConfig(nil); err != nil {
+		t.Fatalf("OnConfig(nil): %v", err)
+	}
+	p.mu.Lock()
+	gotRepo := p.repo
+	gotIntvl := p.interval
+	p.mu.Unlock()
+	if gotRepo != "opt/repo" {
+		t.Fatalf("after OnConfig(nil), repo = %q, want opt/repo (option)", gotRepo)
+	}
+	if gotIntvl != 3*time.Hour {
+		t.Fatalf("after OnConfig(nil), interval = %s, want 3h (option)", gotIntvl)
+	}
+}
+
+// TestPlugin_OnConfig_FieldRemoval_Resets asserts the key-absence reset at
+// field granularity: if a [plugins.autoupdate] section is present but a
+// previously-set key (e.g. interval) is deleted, OnConfig reverts that field
+// to its default rather than retaining the stale value.
+func TestPlugin_OnConfig_FieldRemoval_Resets(t *testing.T) {
+	t.Setenv(envDisable, "")
+	t.Setenv(envRepo, "")
+	t.Setenv(envChannel, "")
+	t.Setenv(envInterval, "")
+
+	p := New()
+	t.Cleanup(func() { _ = p.Shutdown() })
+
+	if err := p.OnConfig(json.RawMessage(`{"repo":"x/y","interval":"2h"}`)); err != nil {
+		t.Fatalf("OnConfig(seed): %v", err)
+	}
+	// User edits the section to remove interval only; repo survives.
+	if err := p.OnConfig(json.RawMessage(`{"repo":"x/y"}`)); err != nil {
+		t.Fatalf("OnConfig(drop interval): %v", err)
+	}
+	p.mu.Lock()
+	gotRepo := p.repo
+	gotIntvl := p.interval
+	p.mu.Unlock()
+	if gotRepo != "x/y" {
+		t.Fatalf("repo clobbered on partial reload: got %q, want x/y", gotRepo)
+	}
+	if gotIntvl != defaultInterval {
+		t.Fatalf("interval not reset on key removal: got %s, want %s", gotIntvl, defaultInterval)
+	}
 }
 
 func TestShutdownStopsCheckerCleanly(t *testing.T) {

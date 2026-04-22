@@ -39,6 +39,20 @@ type ClientReceiver interface {
 	SetClient(*Client)
 }
 
+// ConfigReceiver is an optional extension: plugins implementing it receive
+// their config sub-tree as a JSON RawMessage. OnConfig fires on every
+// Initialize dispatch (once before OnInitialize on spawn, and again on every
+// host reload), regardless of whether a config sub-tree is present. A nil
+// raw argument means `[plugins.<name>]` is absent from the effective config;
+// plugins should treat this as a reset/defaults signal. This mirrors the
+// in-process plugin.ConfigReceiver contract — the host invokes both with the
+// same semantics. Plugins that only need config at startup can also read it
+// from the Initialize frame (the Config field), whichever is more
+// convenient.
+type ConfigReceiver interface {
+	OnConfig(raw json.RawMessage) error
+}
+
 // Base is a zero-value Plugin with no-op defaults. Embed it to avoid
 // implementing methods you do not care about. Base also satisfies
 // ClientReceiver: call Base.Client() from your methods to reach the host.
@@ -56,6 +70,9 @@ func (b *Base) Client() *Client { return b.client }
 
 // OnInitialize is the no-op default.
 func (b *Base) OnInitialize(root string, capabilities []string) error { return nil }
+
+// OnConfig is the no-op default; plugins that care about config override it.
+func (Base) OnConfig(raw json.RawMessage) error { return nil }
 
 // OnShutdown is the no-op default.
 func (b *Base) OnShutdown() error { return nil }
@@ -316,6 +333,18 @@ func dispatch(p Plugin, codec *plugin.Codec, method string, id any, params json.
 		var ev plugin.Initialize
 		if err := json.Unmarshal(params, &ev); err != nil {
 			return writeInvalidParams(codec, id, err)
+		}
+		// OnConfig fires before OnInitialize so receivers see config first.
+		// OnConfig errors are logged but non-fatal, matching the in-proc
+		// host behaviour in plugin.Host.callOnConfig. OnConfig fires on every
+		// Initialize dispatch — even when ev.Config is nil — so plugins see a
+		// uniform contract across initial spawn and reload. A nil raw signals
+		// "no [plugins.<name>] section is present; reset to defaults". See
+		// ConfigReceiver above.
+		if cr, ok := p.(ConfigReceiver); ok {
+			if cfgErr := cr.OnConfig(ev.Config); cfgErr != nil {
+				fmt.Fprintf(os.Stderr, "plugsdk: OnConfig: %v\n", cfgErr)
+			}
 		}
 		initErr := p.OnInitialize(ev.RootPath, ev.Capabilities)
 		if id == nil {

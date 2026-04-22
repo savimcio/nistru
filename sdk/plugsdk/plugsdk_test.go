@@ -890,6 +890,151 @@ func (p *bufferEditPlugin) OnExecuteCommand(id string, args json.RawMessage) (an
 	return nil, nil
 }
 
+// configRecordingPlugin implements ConfigReceiver and records every OnConfig
+// invocation (raw bytes + ordering vs. OnInitialize) so tests can assert the
+// SDK routes config through the optional interface correctly.
+type configRecordingPlugin struct {
+	Base
+	mu            sync.Mutex
+	configs       []json.RawMessage
+	initsAfterCfg int // incremented on OnInitialize only when configs non-empty at call time
+	inits         int
+}
+
+func (p *configRecordingPlugin) OnConfig(raw json.RawMessage) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cp := make(json.RawMessage, len(raw))
+	copy(cp, raw)
+	p.configs = append(p.configs, cp)
+	return nil
+}
+
+func (p *configRecordingPlugin) OnInitialize(root string, caps []string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.inits++
+	if len(p.configs) > 0 {
+		p.initsAfterCfg++
+	}
+	return nil
+}
+
+// TestSDK_Initialize_RoutesConfigToReceiver asserts an initialize frame
+// carrying a Config sub-tree invokes OnConfig with the exact bytes before
+// OnInitialize fires.
+func TestSDK_Initialize_RoutesConfigToReceiver(t *testing.T) {
+	pluginSide, host, cleanup := pipePair()
+	defer cleanup()
+
+	p := &configRecordingPlugin{}
+	done := startRun(p, pluginSide)
+
+	want := json.RawMessage(`{"a":1}`)
+	if err := host.WriteRequest("initialize", 1, plugin.Initialize{
+		RootPath:     "/r",
+		Capabilities: []string{"commands"},
+		Config:       want,
+	}); err != nil {
+		t.Fatalf("write init: %v", err)
+	}
+	_, _, _, isResp, resp := readOne(t, host)
+	if !isResp || resp == nil || resp.Error != nil {
+		t.Fatalf("expected success response, got isResp=%v resp=%+v", isResp, resp)
+	}
+
+	p.mu.Lock()
+	if got := len(p.configs); got != 1 {
+		p.mu.Unlock()
+		t.Fatalf("OnConfig calls = %d, want 1", got)
+	}
+	if string(p.configs[0]) != string(want) {
+		p.mu.Unlock()
+		t.Fatalf("OnConfig raw = %s, want %s", p.configs[0], want)
+	}
+	if p.inits != 1 {
+		p.mu.Unlock()
+		t.Fatalf("OnInitialize calls = %d, want 1", p.inits)
+	}
+	if p.initsAfterCfg != 1 {
+		p.mu.Unlock()
+		t.Fatalf("OnInitialize fired before OnConfig (initsAfterCfg=%d)", p.initsAfterCfg)
+	}
+	p.mu.Unlock()
+
+	if err := host.WriteNotification("shutdown", struct{}{}); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if err := waitDone(t, done, 2*time.Second); err != nil {
+		t.Fatalf("RunWith: %v", err)
+	}
+}
+
+// TestSDK_Initialize_NoConfig_CallsOnConfigWithNil asserts the unified
+// ConfigReceiver contract: an initialize frame without a Config field still
+// invokes OnConfig with a nil raw argument, signalling "no config section
+// is present; reset to defaults". This matches the in-process host contract
+// in plugin.ConfigReceiver — both transports have uniform semantics so
+// plugin authors don't need to special-case their transport.
+func TestSDK_Initialize_NoConfig_CallsOnConfigWithNil(t *testing.T) {
+	pluginSide, host, cleanup := pipePair()
+	defer cleanup()
+
+	p := &configRecordingPlugin{}
+	done := startRun(p, pluginSide)
+
+	if err := host.WriteRequest("initialize", 1, plugin.Initialize{
+		RootPath:     "/r",
+		Capabilities: []string{"commands"},
+	}); err != nil {
+		t.Fatalf("write init: %v", err)
+	}
+	_, _, _, isResp, resp := readOne(t, host)
+	if !isResp || resp == nil || resp.Error != nil {
+		t.Fatalf("expected success response, got isResp=%v resp=%+v", isResp, resp)
+	}
+
+	p.mu.Lock()
+	if got := len(p.configs); got != 1 {
+		p.mu.Unlock()
+		t.Fatalf("OnConfig calls = %d, want 1 (with nil raw when no Config field)", got)
+	}
+	if got := len(p.configs[0]); got != 0 {
+		raw := p.configs[0]
+		p.mu.Unlock()
+		t.Fatalf("OnConfig raw = %s, want nil/empty when initialize frame has no Config", raw)
+	}
+	if p.inits != 1 {
+		p.mu.Unlock()
+		t.Fatalf("OnInitialize calls = %d, want 1", p.inits)
+	}
+	// OnConfig must still fire before OnInitialize.
+	if p.initsAfterCfg != 1 {
+		p.mu.Unlock()
+		t.Fatalf("OnInitialize fired before OnConfig (initsAfterCfg=%d)", p.initsAfterCfg)
+	}
+	p.mu.Unlock()
+
+	if err := host.WriteNotification("shutdown", struct{}{}); err != nil {
+		t.Fatalf("shutdown: %v", err)
+	}
+	if err := waitDone(t, done, 2*time.Second); err != nil {
+		t.Fatalf("RunWith: %v", err)
+	}
+}
+
+// TestSDK_Base_OnConfig_IsNoOp asserts the default Base.OnConfig is a
+// harmless no-op for embedders that don't care about config.
+func TestSDK_Base_OnConfig_IsNoOp(t *testing.T) {
+	var b Base
+	if err := b.OnConfig(nil); err != nil {
+		t.Fatalf("Base.OnConfig(nil) = %v, want nil", err)
+	}
+	if err := b.OnConfig([]byte("{}")); err != nil {
+		t.Fatalf("Base.OnConfig({}) = %v, want nil", err)
+	}
+}
+
 // TestToUint64Accepts covers each branch of the id-normalizer the SDK uses
 // when routing responses.
 func TestToUint64Accepts(t *testing.T) {

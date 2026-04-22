@@ -120,7 +120,7 @@ func TestScheduleSave_EmitsSaveTickMsgWithGen(t *testing.T) {
 		t.Skip("relies on 250ms debounce timer; use full go test to run")
 	}
 	t.Parallel()
-	cmd := scheduleSave(42)
+	cmd := scheduleSave(42, 250*time.Millisecond)
 	if cmd == nil {
 		t.Fatalf("scheduleSave returned nil cmd")
 	}
@@ -137,7 +137,7 @@ func TestScheduleSave_EmitsSaveTickMsgWithGen(t *testing.T) {
 func TestScheduleChange_EmitsChangeTickMsgWithGen(t *testing.T) {
 	// 50ms debounce — fast enough to run under -short.
 	t.Parallel()
-	cmd := scheduleChange(7)
+	cmd := scheduleChange(7, 50*time.Millisecond)
 	if cmd == nil {
 		t.Fatalf("scheduleChange returned nil cmd")
 	}
@@ -165,8 +165,8 @@ func TestScheduleSave_StaleVsCurrent(t *testing.T) {
 	// to a single 250ms window instead of two back-to-back windows.
 	staleCh := make(chan tea.Msg, 1)
 	freshCh := make(chan tea.Msg, 1)
-	staleCmd := scheduleSave(10)
-	freshCmd := scheduleSave(11)
+	staleCmd := scheduleSave(10, 250*time.Millisecond)
+	freshCmd := scheduleSave(11, 250*time.Millisecond)
 	go func() { staleCh <- staleCmd() }()
 	go func() { freshCh <- freshCmd() }()
 

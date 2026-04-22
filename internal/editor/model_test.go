@@ -9,6 +9,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/kujtimiihoxha/vimtea"
 
+	"github.com/savimcio/nistru/internal/config"
 	"github.com/savimcio/nistru/plugin"
 )
 
@@ -271,9 +272,11 @@ func TestEditorWidth_WithAndWithoutLeftPane(t *testing.T) {
 		t.Errorf("no leftPane: got %d, want 100", got)
 	}
 
-	// With a left pane, the editor's width is width - treeWidth.
+	// With a left pane, the editor's width is width - tree-pane width.
+	// m.treeWidth() falls back to config.Defaults().UI.TreeWidth when
+	// m.cfg is nil — matching these hand-built Models.
 	m2 := &Model{width: 100, leftPane: stubPane{}}
-	want := 100 - treeWidth
+	want := 100 - config.Defaults().UI.TreeWidth
 	if got := m2.editorWidth(); got != want {
 		t.Errorf("with leftPane: got %d, want %d", got, want)
 	}

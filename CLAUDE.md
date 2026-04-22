@@ -1,6 +1,6 @@
 # Nistru — project guide for Claude Code
 
-Nistru is a Bubble Tea TUI editor with an in-proc + out-of-proc plugin system. The editor core lives in [internal/editor/](internal/editor/) ([model.go](internal/editor/model.go), [editor.go](internal/editor/editor.go), [palette.go](internal/editor/palette.go), [autosave.go](internal/editor/autosave.go)); the binary entry point is [cmd/nistru/main.go](cmd/nistru/main.go); first-party in-proc plugins live under [internal/plugins/](internal/plugins/); the host lives in [plugin/](plugin/); the plugin SDK and harness in [sdk/plugsdk/](sdk/plugsdk/); examples in [examples/](examples/). See [docs/testing.md](docs/testing.md) for the full testing strategy. This file is the fast rules.
+Nistru is a Bubble Tea TUI editor with an in-proc + out-of-proc plugin system. The editor core lives in [internal/editor/](internal/editor/) ([model.go](internal/editor/model.go), [editor.go](internal/editor/editor.go), [palette.go](internal/editor/palette.go), [autosave.go](internal/editor/autosave.go)); the layered TOML config (user + project + env, threaded into editor and plugins) lives in [internal/config/](internal/config/); the binary entry point is [cmd/nistru/main.go](cmd/nistru/main.go); first-party in-proc plugins live under [internal/plugins/](internal/plugins/); the host lives in [plugin/](plugin/); the plugin SDK and harness in [sdk/plugsdk/](sdk/plugsdk/); examples in [examples/](examples/). See [docs/testing.md](docs/testing.md) for the full testing strategy. This file is the fast rules.
 
 ## Commands
 
@@ -38,6 +38,7 @@ See [docs/testing.md](docs/testing.md) for when each tier applies.
 - Touching [sdk/plugsdk/plugsdk.go](sdk/plugsdk/plugsdk.go) → update [sdk/plugsdk/plugsdk_test.go](sdk/plugsdk/plugsdk_test.go); if a new public harness API is needed, add it to [sdk/plugsdk/plugintest/](sdk/plugsdk/plugintest/).
 - Adding a new **plugin event or effect** → extend tests on both sides: host side in [plugin/host_test.go](plugin/host_test.go), SDK side in [sdk/plugsdk/plugsdk_test.go](sdk/plugsdk/plugsdk_test.go), and the harness in [sdk/plugsdk/plugintest/plugintest.go](sdk/plugsdk/plugintest/plugintest.go).
 - Adding a new **palette command or keybinding** → [internal/editor/palette_test.go](internal/editor/palette_test.go) unit + either [internal/editor/model_component_test.go](internal/editor/model_component_test.go) or [internal/editor/model_e2e_test.go](internal/editor/model_e2e_test.go) flow.
+- Touching [internal/config/](internal/config/) → extend the unit tests in the same package; if the public API changes (new field/type), update [docs/plugins.md](docs/plugins.md) and the TOML schema section there.
 
 ## Goldens
 

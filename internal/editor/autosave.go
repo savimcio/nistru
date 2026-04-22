@@ -39,20 +39,23 @@ type openFileRequestMsg struct {
 	path string
 }
 
-// scheduleSave returns a tea.Cmd that fires a saveTickMsg after the debounce
-// window. Later edits bump saveGen so this tick will no-op when it lands.
-func scheduleSave(gen int) tea.Cmd {
-	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
+// scheduleSave returns a tea.Cmd that fires a saveTickMsg after the provided
+// debounce window. Later edits bump saveGen so this tick will no-op when it
+// lands. The debounce duration is supplied by the caller (see
+// config.Autosave.SaveDebounce) so the helper stays pure.
+func scheduleSave(gen int, debounce time.Duration) tea.Cmd {
+	return tea.Tick(debounce, func(time.Time) tea.Msg {
 		return saveTickMsg{gen: gen}
 	})
 }
 
 // scheduleChange returns a tea.Cmd that fires a changeTickMsg after the
-// debounce window. Later edits bump changeGen so this tick will no-op when
-// it lands. Shorter than scheduleSave because plugin consumers (formatters,
-// linters) want quicker feedback than the autosave cadence.
-func scheduleChange(gen int) tea.Cmd {
-	return tea.Tick(50*time.Millisecond, func(time.Time) tea.Msg {
+// provided debounce window. Later edits bump changeGen so this tick will
+// no-op when it lands. Shorter than scheduleSave in practice because plugin
+// consumers (formatters, linters) want quicker feedback than the autosave
+// cadence; the exact value lives in config.Autosave.ChangeDebounce.
+func scheduleChange(gen int, debounce time.Duration) tea.Cmd {
+	return tea.Tick(debounce, func(time.Time) tea.Msg {
 		return changeTickMsg{gen: gen}
 	})
 }
