@@ -798,10 +798,25 @@ func editorKnobsChanged(a, b editorKnobs) bool {
 }
 
 // openFile handles opening path: read the file, guard against binary/oversize
-// content, reconstruct the editor (fresh instance re-registers Ctrl bindings
-// via newEditor → addCtrlBindings), seed lastText so the newly-loaded content
-// does not immediately register as dirty, move focus to the editor, and emit
-// DidClose (for the previous file) + DidOpen to the plugin host.
+// content, swap the editor's buffer in place via SetContent, seed lastText so
+// the newly-loaded content does not immediately register as dirty, move focus
+// to the editor, and emit DidClose (for the previous file) + DidOpen to the
+// plugin host.
+//
+// The editor instance itself is reused across file opens. goeditor's Init
+// spawns a blocking channel listener, and its internal vim interpreter emits
+// timer cmds (cursor blink, DispatchMessage TTL). Constructing a fresh editor
+// on every open — as this function used to — leaked those in-flight cmds from
+// the previous adapter; when they resolved, the resulting tea.Msg reached the
+// Model and (per the non-key forwarding in Update) landed on the NEW editor,
+// producing stale state bleed across files. SetContent inside goeditor drops
+// the old buffer (history, cursor, viewport) while keeping the channel alive,
+// which is exactly the lifecycle we want.
+//
+// We also force ModeNormal post-swap because the previous implementation got
+// that for free from "new editor starts in Normal" — without the explicit
+// reset, opening a file while the prior buffer was mid-Insert would leave the
+// new file in Insert mode, which would be a UX regression.
 func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -826,9 +841,9 @@ func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 		return m, m.editor.SetStatusMessage("refusing: binary file")
 	}
 
-	// Before we swap editors, flush any unsaved edits in the currently-open
-	// file. If that flush fails, abort the open rather than silently dropping
-	// the user's work.
+	// Before we replace the buffer, flush any unsaved edits in the currently-
+	// open file. If that flush fails, abort the open rather than silently
+	// dropping the user's work.
 	if m.dirty && m.openPath != "" {
 		if err := m.flushNow(); err != nil {
 			m.statusErr = err.Error()
@@ -839,9 +854,19 @@ func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 	prevPath := m.openPath
 
 	content := string(b)
-	m.editor = newEditor(content, path, m.editorOptsFromCfg())
+	// Swap the buffer in place. goeditor's SetContent → SetBuffer resets the
+	// per-file state (history, cursor, viewport) without touching the channel
+	// Init listens on, so the lifecycle stays single-instance for the Model's
+	// lifetime. See the function doc for why we don't reconstruct.
+	m.editor.SetContent(content)
+	// Force Normal mode so opening a file mid-Insert doesn't land the user in
+	// Insert on the new buffer — previously this came free from constructing
+	// a fresh editor.
+	_ = m.editor.SetMode(ModeNormal)
 
-	// Push the current size into the new editor instance.
+	// Re-push the current size so goeditor's viewport picks up the new buffer
+	// at the correct dimensions (SetBuffer calls ScrollViewport but does not
+	// know about the outer pane's width/height).
 	contentH := m.height - statusBarLines
 	contentH = max(contentH, 1)
 	_ = m.editor.SetSize(m.editorWidth(), contentH)
@@ -875,9 +900,15 @@ func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 		m.leftPane.OnFocus(m.focus == focusTree)
 	}
 
-	cmds := []tea.Cmd{m.editor.Init()}
+	// No editor.Init() here: the editor is reused, and Init was already called
+	// at Model construction. Re-calling would spawn a second listener goroutine
+	// on the same channel — a subtle leak we now avoid.
+	var cmds []tea.Cmd
 	if effCmd := m.applyEffects(openEffs); effCmd != nil {
 		cmds = append(cmds, effCmd)
+	}
+	if len(cmds) == 0 {
+		return m, nil
 	}
 	return m, tea.Batch(cmds...)
 }

@@ -103,13 +103,56 @@ func TestModel_OpenFileFlow(t *testing.T) {
 		if txt := got.editor.Content(); txt != got.lastText {
 			t.Errorf("editor buffer mismatch: got %q, want %q", txt, got.lastText)
 		}
-		// openFile returns tea.Batch(editor.Init(), ...) — non-nil cmd.
-		if cmd == nil {
-			t.Errorf("expected non-nil cmd from openFile; got nil")
-		}
+		// openFile no longer issues a fresh editor.Init(): F2.1 switched to
+		// reusing the single editor instance across opens, so Init() (and its
+		// outstanding listener goroutine) only runs once at Model construction.
+		// The returned cmd therefore carries only plugin-effect cmds from the
+		// DidOpen dispatch — nil when no registered plugin produces an effect
+		// (the typical component-test case). Asserting nil here would be too
+		// strict if a plugin ever registered in newTestModel's host; asserting
+		// non-nil would be too strict when none do. We assert the observable
+		// contract instead: the editor is the same instance before and after
+		// open, and the state we care about (openPath, dirty, focus) is set.
+		_ = cmd
 		// Focus flips to editor on open.
 		if got.focus != focusEditor {
 			t.Errorf("focus after open: got %v, want focusEditor", got.focus)
+		}
+	})
+
+	// F2.1 regression: openFile must reuse m.editor across opens rather than
+	// constructing a new adapter. Fresh adapters leaked goeditor's in-flight
+	// timer/Init cmds past the swap, so stale tea.Msgs from the previous
+	// editor landed on the new one via the non-key forwarding path.
+	t.Run("editor instance is reused across successful opens", func(t *testing.T) {
+		dir := t.TempDir()
+		pathA := writeFile(t, dir, "a.txt", "hello A\n")
+		pathB := writeFile(t, dir, "b.txt", "hello B\n")
+		m := newTestModel(t, dir)
+
+		initialEditor := m.editor
+
+		newM, _ := m.Update(openFileRequestMsg{path: pathA})
+		afterA := newM.(*Model)
+		if afterA.editor != initialEditor {
+			t.Fatalf("editor identity changed on first open; F2.1 requires reuse")
+		}
+		if got := afterA.editor.Content(); got != "hello A" {
+			t.Errorf("buffer after open(A) = %q, want %q", got, "hello A")
+		}
+
+		newM, _ = afterA.Update(openFileRequestMsg{path: pathB})
+		afterB := newM.(*Model)
+		if afterB.editor != initialEditor {
+			t.Errorf("editor identity changed on second open; F2.1 requires reuse")
+		}
+		if got := afterB.editor.Content(); got != "hello B" {
+			t.Errorf("buffer after open(B) = %q, want %q", got, "hello B")
+		}
+		// Mode must be Normal after the swap even if the previous buffer was
+		// mid-Insert — opening a file should not strand the user in Insert.
+		if mode := afterB.editor.Mode(); mode != ModeNormal {
+			t.Errorf("mode after open(B) = %v, want ModeNormal", mode)
 		}
 	})
 
