@@ -442,26 +442,37 @@ func TestUpdate_WindowSizeMsgSetsDimsAndForwardsToEditor(t *testing.T) {
 }
 
 // Default-case Update dispatch (unknown tea.Msg) must call forwardToFocused
-// without panicking. With no leftPane and focusTree, non-KeyMsg traffic is
-// dropped silently — exercise that early return.
+// without panicking. Non-key messages are forwarded to the editor regardless
+// of focus (so the editor's internal timers — e.g. DispatchMessage's clear
+// tick — keep working when the tree has focus). See F.4 regression in
+// TestForwardToFocused_NonKeyMsgAlwaysReachesEditor below.
 
 type unknownMsg struct{}
 
-func TestUpdate_UnknownMsgWithNoLeftPaneIsNoOp(t *testing.T) {
+func TestUpdate_UnknownMsgForwardsToEditorEvenWhenTreeFocused(t *testing.T) {
+	fe := &fakeEditor{}
 	m := &Model{
-		editor:   &fakeEditor{},
+		editor:   fe,
 		focus:    focusTree,
 		leftPane: nil,
 	}
-	newM, cmd := m.Update(unknownMsg{})
-	// Compare via the concrete type — Update returns tea.Model, but the
-	// underlying value is our *Model pointer.
+	msg := unknownMsg{}
+	newM, cmd := m.Update(msg)
 	got, ok := newM.(*Model)
 	if !ok || got != m {
 		t.Errorf("Update should return the same *Model pointer; got %T (%v)", newM, newM)
 	}
 	if cmd != nil {
-		t.Errorf("unknown msg with focusTree+no leftPane should produce nil cmd")
+		t.Errorf("fakeEditor.Update returns nil; wrapper should not synthesise a cmd, got %v", cmd)
+	}
+	// F.4: the unknown message must have reached the editor even though
+	// the tree has focus. Without this the editor's DispatchMessage timers
+	// stall and status messages stick.
+	if len(fe.updateMsgs) != 1 {
+		t.Fatalf("editor should have received 1 msg when tree focused; got %d: %+v", len(fe.updateMsgs), fe.updateMsgs)
+	}
+	if fe.updateMsgs[0] != msg {
+		t.Errorf("editor received unexpected msg: got %+v, want %+v", fe.updateMsgs[0], msg)
 	}
 }
 

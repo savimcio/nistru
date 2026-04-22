@@ -1258,3 +1258,57 @@ func splitGutterNumber(s string) (num, rest string) {
 	}
 	return s[start:i], s[i:]
 }
+
+// -----------------------------------------------------------------------------
+// F.4 regression: non-key messages must always reach the editor, regardless
+// of focus. goeditor uses non-key tea.Msgs to drive transient UI such as
+// DispatchMessage's clear timer. When the tree has focus (the default at
+// startup), the old routing dropped those messages and status text that the
+// editor emitted via SetStatusMessage stuck on screen forever.
+
+func TestForwardToFocused_NonKeyMsgAlwaysReachesEditor(t *testing.T) {
+	type arbitraryTickMsg struct{ tag string }
+
+	t.Run("tree focused: non-key msg is forwarded to editor", func(t *testing.T) {
+		fe := &fakeEditor{}
+		m := &Model{editor: fe, focus: focusTree}
+		msg := arbitraryTickMsg{tag: "clear-status"}
+
+		_, _ = m.forwardToFocused(msg)
+		if len(fe.updateMsgs) != 1 {
+			t.Fatalf("editor should have received the non-key msg; got %d: %+v", len(fe.updateMsgs), fe.updateMsgs)
+		}
+		if got, _ := fe.updateMsgs[0].(arbitraryTickMsg); got != msg {
+			t.Errorf("editor received wrong msg: got %+v, want %+v", fe.updateMsgs[0], msg)
+		}
+	})
+
+	t.Run("editor focused: non-key msg still forwarded", func(t *testing.T) {
+		fe := &fakeEditor{}
+		m := &Model{editor: fe, focus: focusEditor}
+		msg := arbitraryTickMsg{tag: "also-reaches"}
+
+		_, _ = m.forwardToFocused(msg)
+		if len(fe.updateMsgs) != 1 {
+			t.Fatalf("editor should have received the non-key msg; got %d: %+v", len(fe.updateMsgs), fe.updateMsgs)
+		}
+	})
+
+	t.Run("tree focused: key msg is NOT forwarded to editor", func(t *testing.T) {
+		// The focus gate still applies to key events — the editor must not
+		// receive keystrokes meant for the tree. This is the other half of
+		// the split and keeps the fix from regressing into "forward all
+		// messages unconditionally".
+		fe := &fakeEditor{}
+		// leftPane == nil → handleKey path for the tree short-circuits to
+		// (m, nil) but the critical assertion is that the editor did NOT
+		// see the key.
+		m := &Model{editor: fe, focus: focusTree, leftPane: nil}
+		key := tea.KeyPressMsg{Code: 'j', Text: "j"}
+
+		_, _ = m.forwardToFocused(key)
+		if len(fe.updateMsgs) != 0 {
+			t.Errorf("editor must NOT see tree-focused key events; got %+v", fe.updateMsgs)
+		}
+	})
+}

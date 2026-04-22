@@ -592,18 +592,28 @@ func (m *Model) guardedQuit() (tea.Model, tea.Cmd) {
 // forwardToFocused dispatches msg to whichever child is currently focused.
 // After forwarding to the editor, we diff the buffer against lastText to
 // decide whether to schedule a debounced autosave + change notification.
+//
+// Key messages are focus-gated (tree vs editor). Non-key messages, however,
+// are ALWAYS forwarded to the editor regardless of focus: goeditor uses
+// non-key messages (tea.Cmd ticks) to drive transient UI such as the timer
+// that clears DispatchMessage text. If we dropped those while the tree had
+// focus, status messages emitted via SetStatusMessage would stick on screen
+// forever because their clear event never arrives. Panes do not consume
+// non-key messages — they get state via OnResize / OnFocus — so the editor
+// is the correct sink for everything non-key.
 func (m *Model) forwardToFocused(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if _, isKey := msg.(tea.KeyPressMsg); !isKey {
+		var cmd tea.Cmd
+		m.editor, cmd = m.editor.Update(msg)
+		return m, cmd
+	}
+
 	if m.focus == focusTree {
 		if m.leftPane == nil {
 			return m, nil
 		}
-		key, ok := msg.(tea.KeyPressMsg)
-		if !ok {
-			// No legacy tree.Update — non-key messages are dropped when the
-			// tree has focus. Panes receive non-key state exclusively via
-			// OnResize / OnFocus.
-			return m, nil
-		}
+		// Safe to type-assert: we just checked msg is a KeyPressMsg above.
+		key := msg.(tea.KeyPressMsg)
 		effs := m.leftPane.HandleKey(keyEventFromTea(key))
 		return m, m.applyEffects(effs)
 	}
