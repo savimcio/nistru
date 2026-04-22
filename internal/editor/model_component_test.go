@@ -195,6 +195,69 @@ func TestModel_OpenFileFlow(t *testing.T) {
 			t.Errorf("expected a status-message cmd on binary refusal")
 		}
 	})
+
+	// F3.3 regression: DidOpen.Text must carry the editor's buffer — which is
+	// what the user will be editing — not the raw file bytes. goeditor drops
+	// the trailing newline on load, so those two strings differ for files
+	// with a trailing '\n'. A plugin that caches DidOpen.Text (e.g. the
+	// bundled gofmt) would otherwise operate on stale content until the
+	// first DidChange arrived.
+	t.Run("DidOpen.Text matches editor buffer, not raw file bytes", func(t *testing.T) {
+		dir := t.TempDir()
+		// Trailing newline is the interesting case — goeditor drops it.
+		raw := "package main\n\nfunc main() {}\n"
+		path := writeFile(t, dir, "hello.go", raw)
+
+		t.Setenv("NISTRU_AUTOUPDATE_DISABLE", "1")
+		t.Setenv("NISTRU_AUTOUPDATE_REPO", "")
+		t.Setenv("NISTRU_AUTOUPDATE_CHANNEL", "")
+		t.Setenv("NISTRU_AUTOUPDATE_INTERVAL", "")
+		rec := &didOpenRecorder{}
+		reg := plugin.NewRegistry()
+		reg.RegisterInProc(rec)
+		m, err := newModelWithRegistry(dir, reg, config.Defaults())
+		if err != nil {
+			t.Fatalf("newModelWithRegistry: %v", err)
+		}
+		t.Cleanup(func() { _ = m.host.Shutdown(100 * time.Millisecond) })
+
+		if _, _ = m.Update(openFileRequestMsg{path: path}); rec.lastOpenText == "" {
+			t.Fatalf("recorder did not receive DidOpen")
+		}
+		// The recorder captures whatever Text the host forwarded — which, after
+		// the fix, is m.lastText (editor's buffer). If the bug reappears it
+		// would be the raw file bytes (with trailing newline).
+		if rec.lastOpenText == raw {
+			t.Errorf("DidOpen.Text carried raw file bytes (%q); should carry editor buffer", raw)
+		}
+		want := m.lastText
+		if rec.lastOpenText != want {
+			t.Errorf("DidOpen.Text = %q, want %q (editor buffer)", rec.lastOpenText, want)
+		}
+	})
+}
+
+// didOpenRecorder is a minimal in-proc plugin that captures the most recent
+// DidOpen event it receives. onStart activates it at boot so it stays
+// subscribed for subsequent DidOpen events (activated plugins receive
+// mismatched-pattern events for state continuity; see host.shouldDispatch).
+type didOpenRecorder struct {
+	mu            sync.Mutex
+	lastOpenText  string
+	lastOpenPath  string
+}
+
+func (r *didOpenRecorder) Name() string           { return "didopen-recorder" }
+func (r *didOpenRecorder) Activation() []string   { return []string{"onStart"} }
+func (r *didOpenRecorder) Shutdown() error        { return nil }
+func (r *didOpenRecorder) OnEvent(event any) []plugin.Effect {
+	if e, ok := event.(plugin.DidOpen); ok {
+		r.mu.Lock()
+		r.lastOpenText = e.Text
+		r.lastOpenPath = e.Path
+		r.mu.Unlock()
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -1102,11 +1165,11 @@ func TestModel_ReloadPalette_UpdatesPluginConfig(t *testing.T) {
 
 // TestModel_ReloadPalette_RelativeNumbersTakesEffect verifies that changing
 // [ui].relative_numbers on disk and firing the reload command actually
-// rebuilds the underlying vimtea.Editor so the new setting is in effect
-// immediately — without waiting for the user to open another file. vimtea
-// doesn't expose the flag on its Editor interface, so the assertion is
-// indirect: we take a before/after snapshot of m.editor's pointer identity
-// and confirm it changed, plus verify m.cfg.UI.RelativeNumbers took the new
+// rebuilds the underlying editor so the new setting is in effect
+// immediately — without waiting for the user to open another file. The
+// Editor interface doesn't expose the flag, so the assertion is indirect:
+// we take a before/after snapshot of m.editor's pointer identity and
+// confirm it changed, plus verify m.cfg.UI.RelativeNumbers took the new
 // value. Together, those two checks cover the observable contract — "the
 // editor instance that renders is the one that booted with the new setting".
 func TestModel_ReloadPalette_RelativeNumbersTakesEffect(t *testing.T) {
@@ -1220,10 +1283,11 @@ func numericEq(v any, want int) bool {
 // T7 — "strange scrolling" regression guards.
 //
 // Opening testdata/wide_table.md at 80x24 previously produced a View() with
-// >24 rows because vimtea's soft-wrap sometimes emits lines wider than the
-// editor viewport; lipgloss's sized Render then wraps each overwide line into
-// two visual rows. The clamp introduced in model.go (clampPaneBox) trims each
-// subpane to the advertised (w, h) before sized styling.
+// >24 rows because the old editor's soft-wrap sometimes emitted lines wider
+// than the editor viewport; lipgloss's sized Render then wrapped each
+// overwide line into two visual rows. goeditor handles width natively at
+// its own boundary, so the stopgap clampPaneBox has been removed; these
+// invariants are implementation-agnostic regression guards.
 
 // openWideTable builds a Model sized to (w, h), loads the wide_table.md
 // fixture into tempdir/wide_table.md, opens it, and returns the Model. It is

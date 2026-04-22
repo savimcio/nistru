@@ -903,10 +903,16 @@ func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 	if prevPath != "" {
 		_ = m.host.Emit(plugin.DidClose{Path: prevPath})
 	}
+	// Publish the editor's actual buffer rather than the raw file bytes —
+	// goeditor does not preserve trailing newlines, so a plugin that caches
+	// DidOpen.Text (e.g. the bundled gofmt) would otherwise operate on stale
+	// content until the first DidChange arrived. m.lastText was seeded above
+	// from m.editor.Content(), which is the canonical view the user is
+	// editing.
 	openEffs := m.host.Emit(plugin.DidOpen{
 		Path: path,
 		Lang: langFromPath(path),
-		Text: content,
+		Text: m.lastText,
 	})
 
 	if m.leftPane != nil && prevFocus != m.focus {

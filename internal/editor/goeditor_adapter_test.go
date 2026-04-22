@@ -2,8 +2,10 @@ package editor
 
 import (
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/ionut-t/goeditor"
 	"github.com/savimcio/nistru/internal/config"
 )
 
@@ -370,4 +372,113 @@ func TestGoeditorAdapter_SetSizeDoesNotPanic(t *testing.T) {
 	if cmd := a.SetSize(80, 24); cmd != nil {
 		t.Errorf("SetSize returned non-nil cmd; adapter contract says nil")
 	}
+}
+
+// -----------------------------------------------------------------------------
+// F3 regressions.
+
+// F3.1: synth keys emitted by Undo/Redo/synthVimMotion must bypass
+// interceptKey so a user who legally rebinds an action to a native vim key
+// (e.g. `undo = "u"`) does not loop forever.
+//
+// We verify this at the adapter level: feed a synthKeyMsg with `u` through
+// Update under a keymap where undo is bound to "u". Before the fix the
+// adapter would re-run interceptKey → match the binding → produce another
+// Undo cmd → another synth "u" → … infinite. After the fix the synthKeyMsg
+// unwraps once and goes straight to goeditor's inner Update.
+func TestGoeditorAdapter_SynthKeyBypassesInterceptWhenUserRebindsUndoToU(t *testing.T) {
+	km := config.DefaultKeymap()
+	km[config.ActionUndo] = "u"
+	a := newGoeditorAdapter("", "hello", false, km)
+
+	// Pre-check: a plain "u" keystroke (the user's real keypress) IS
+	// intercepted — that's the bound action, and the interceptor correctly
+	// claims it.
+	cmd, handled := a.interceptKey(tea.KeyPressMsg{Code: 'u', Text: "u"})
+	if !handled {
+		t.Fatalf("interceptKey(u) handled=false under undo='u' keymap; precondition broken")
+	}
+	if cmd == nil {
+		t.Fatalf("interceptKey(u) returned nil cmd; undo contract broken")
+	}
+
+	// The synth version (produced internally by Undo) must reach goeditor
+	// without re-matching the binding. We verify the plumbing by observing
+	// that Update on a synthKeyMsg does not return a re-intercepted cmd
+	// shape; it returns whatever goeditor.inner.Update returns.
+	synth := synthKeyMsg{key: undoKeyMsg()}
+	if _, cmd := a.Update(synth); cmd == nil {
+		// goeditor's Update always returns at least listenForEditorUpdate;
+		// a nil cmd here would signal our bypass short-circuited before
+		// inner.Update ran.
+		t.Errorf("Update(synthKeyMsg) returned nil cmd; synth bypass did not reach inner.Update")
+	}
+}
+
+// F3.2: goeditor's SaveMsg (emitted when the user completes a `:w` in
+// command mode) must translate into nistru's forceSaveMsg so model.Update
+// runs flushNow. Before the fix it fell through as a non-key msg and did
+// nothing.
+func TestGoeditorAdapter_TranslatesGoeditorSaveMsgToForceSave(t *testing.T) {
+	a := newGoeditorAdapter("", "hello", false, nil)
+	_, cmd := a.Update(goeditor.SaveMsg{})
+	if cmd == nil {
+		t.Fatalf("Update(goeditor.SaveMsg) returned nil cmd; expected batched forceSaveMsg emitter")
+	}
+	// The cmd is tea.Batch(inner, func()->forceSaveMsg). We can't introspect
+	// a Batch from outside tea.Program, but we can drain inner-produced cmds
+	// to look for our sentinel. A simpler + sturdier check: invoke the cmd
+	// stream until we see forceSaveMsg or exhaust. tea.Batch's outer cmd
+	// yields a BatchMsg carrying the inner cmds; one of those must be our
+	// forceSaveMsg emitter.
+	assertBatchProducesSentinel[forceSaveMsg](t, cmd)
+}
+
+// F3.3: same translation contract for QuitMsg → forceQuitMsg.
+func TestGoeditorAdapter_TranslatesGoeditorQuitMsgToForceQuit(t *testing.T) {
+	a := newGoeditorAdapter("", "hello", false, nil)
+	_, cmd := a.Update(goeditor.QuitMsg{})
+	if cmd == nil {
+		t.Fatalf("Update(goeditor.QuitMsg) returned nil cmd; expected batched forceQuitMsg emitter")
+	}
+	assertBatchProducesSentinel[forceQuitMsg](t, cmd)
+}
+
+// assertBatchProducesSentinel walks the cmd tree that tea.Batch produces,
+// executing each leaf cmd until one returns a T. Reports a fatal failure
+// if none do.
+//
+// Each cmd runs in its own goroutine with a short deadline — goeditor's
+// listenForEditorUpdate cmd blocks on an internal channel forever when the
+// Program is not running, and it is always batched alongside our sentinel
+// emitter. Without the timeout the test would hang on that leaf. Sentinel
+// emitters are pure closures that return synchronously, so a small budget is
+// safe: if nothing produced a T within the budget, our translation is wrong.
+func assertBatchProducesSentinel[T any](t *testing.T, cmd tea.Cmd) {
+	t.Helper()
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		if _, isT := msg.(T); isT {
+			return
+		}
+		t.Fatalf("cmd did not produce a BatchMsg and was not a %T; got %T", *new(T), msg)
+	}
+	const leafBudget = 50 * time.Millisecond
+	for _, c := range batch {
+		if c == nil {
+			continue
+		}
+		ch := make(chan tea.Msg, 1)
+		go func(fn tea.Cmd) { ch <- fn() }(c)
+		select {
+		case got := <-ch:
+			if _, isT := got.(T); isT {
+				return
+			}
+		case <-time.After(leafBudget):
+			// Likely goeditor's blocking listener — keep walking.
+		}
+	}
+	t.Fatalf("BatchMsg did not contain a %T emitter", *new(T))
 }

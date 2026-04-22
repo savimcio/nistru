@@ -8,6 +8,12 @@ import (
 	"github.com/savimcio/nistru/internal/config"
 )
 
+// TODO: goeditor reserves a command-line row in its bottom chrome, which renders
+// as a blank line between goeditor's statusline and nistru's outer status bar.
+// Investigate whether goeditor exposes an option to hide the cmdline row when idle,
+// or upstream a patch. Until then, the blank row is Vim-standard behavior and
+// all row-count invariants still hold.
+
 // goeditorAdapter wraps a goeditor.Model and exposes it behind the narrow
 // Editor interface. It also hosts the nistru-level key interception layer:
 // micro-style Ctrl+Z/Y/X/C/V shortcuts are recognised here and translated
@@ -32,8 +38,8 @@ type goeditorAdapter struct {
 }
 
 // statusDispatchDuration is the default TTL for DispatchMessage. goeditor's
-// own API takes a duration; 3s matches vimtea's prior feel for a transient
-// status-line flash.
+// own API takes a duration; 3s is a comfortable flash for a transient
+// status-line message.
 const statusDispatchDuration = 3 * time.Second
 
 var _ Editor = (*goeditorAdapter)(nil)
@@ -68,15 +74,53 @@ func (a *goeditorAdapter) Init() tea.Cmd { return a.inner.Init() }
 
 // Update routes the message through the interception layer first. Anything
 // the interceptor claims never reaches goeditor.
+//
+// Two special cases bypass interceptKey:
+//
+//   - synthKeyMsg wraps a KeyPressMsg produced by Undo/Redo/synthVimMotion.
+//     If we fed these back through interceptKey, a user who rebinds e.g.
+//     `undo = "u"` would self-recurse: interceptKey matches "u" → Undo()
+//     emits "u" → interceptKey matches again → loop. Unwrapping here sends
+//     the synthesised key straight to goeditor so it reaches the vim
+//     interpreter once and only once.
+//
+//   - goeditor.SaveMsg / QuitMsg are signals goeditor's listener emits when
+//     the user completes a command-mode action like ":w" or ":q". They are
+//     not input keystrokes, so they never meet interceptKey; we translate
+//     them into the nistru-level forceSaveMsg / forceQuitMsg that
+//     model.Update already handles (flushNow / guardedQuit). Without this
+//     translation, the messages fell through and goeditor's command-mode
+//     save/quit path had no effect.
 func (a *goeditorAdapter) Update(msg tea.Msg) (Editor, tea.Cmd) {
-	if km, ok := msg.(tea.KeyPressMsg); ok {
-		if cmd, handled := a.interceptKey(km); handled {
+	switch m := msg.(type) {
+	case synthKeyMsg:
+		next, cmd := a.inner.Update(m.key)
+		a.inner = next
+		return a, cmd
+	case goeditor.SaveMsg:
+		next, cmd := a.inner.Update(msg)
+		a.inner = next
+		return a, tea.Batch(cmd, func() tea.Msg { return forceSaveMsg{} })
+	case goeditor.QuitMsg:
+		next, cmd := a.inner.Update(msg)
+		a.inner = next
+		return a, tea.Batch(cmd, func() tea.Msg { return forceQuitMsg{} })
+	case tea.KeyPressMsg:
+		if cmd, handled := a.interceptKey(m); handled {
 			return a, cmd
 		}
 	}
 	next, cmd := a.inner.Update(msg)
 	a.inner = next
 	return a, cmd
+}
+
+// synthKeyMsg wraps a KeyPressMsg produced internally by Undo/Redo/
+// synthVimMotion so the adapter's Update can route it directly to goeditor
+// without re-running interceptKey on it. See the Update comment for the
+// rebind-recursion issue this prevents.
+type synthKeyMsg struct {
+	key tea.KeyPressMsg
 }
 
 func (a *goeditorAdapter) View() string { return a.inner.View() }
@@ -205,19 +249,22 @@ func redoKeyMsg() tea.KeyPressMsg {
 // Undo synthesises the vim 'u' keypress in Normal mode. goeditor has no
 // public Undo() method, but its built-in vim interpreter handles 'u' as
 // undo. We ensure Normal mode first so 'u' is not treated as literal text
-// in Insert mode.
+// in Insert mode. The emitted KeyPressMsg is wrapped in synthKeyMsg so the
+// adapter's Update routes it past interceptKey — a user who binds undo to
+// "u" would otherwise re-match and self-recurse.
 func (a *goeditorAdapter) Undo() tea.Cmd {
 	return tea.Sequence(
 		a.cmdEnterNormal(),
-		func() tea.Msg { return undoKeyMsg() },
+		func() tea.Msg { return synthKeyMsg{key: undoKeyMsg()} },
 	)
 }
 
-// Redo synthesises the vim 'U' (uppercase) keypress in Normal mode.
+// Redo synthesises the vim 'U' (uppercase) keypress in Normal mode. Wrapped
+// in synthKeyMsg for the same reason as Undo.
 func (a *goeditorAdapter) Redo() tea.Cmd {
 	return tea.Sequence(
 		a.cmdEnterNormal(),
-		func() tea.Msg { return redoKeyMsg() },
+		func() tea.Msg { return synthKeyMsg{key: redoKeyMsg()} },
 	)
 }
 
@@ -269,20 +316,21 @@ func (a *goeditorAdapter) interceptKey(km tea.KeyPressMsg) (tea.Cmd, bool) {
 }
 
 // synthVimMotion emits a Normal-mode transition followed by the given
-// single-rune keystrokes as KeyPressMsg values, in order, via tea.Sequence.
-// tea.Sequence guarantees strict ordering so multi-rune motions like "dd"
-// and "yy" cannot be corrupted by concurrent user input.
+// single-rune keystrokes as synthKeyMsg-wrapped KeyPressMsg values, in order,
+// via tea.Sequence. tea.Sequence guarantees strict ordering so multi-rune
+// motions like "dd" and "yy" cannot be corrupted by concurrent user input.
+// The synthKeyMsg wrapper keeps the keys from re-entering interceptKey; see
+// the Update comment for the self-recursion case that motivates it.
 func (a *goeditorAdapter) synthVimMotion(keys ...string) tea.Cmd {
 	cmds := make([]tea.Cmd, 0, 1+len(keys))
 	cmds = append(cmds, a.cmdEnterNormal())
 	for _, k := range keys {
-		k := k
 		cmds = append(cmds, func() tea.Msg {
 			runes := []rune(k)
 			if len(runes) == 0 {
 				return nil
 			}
-			return tea.KeyPressMsg{Code: runes[0], Text: k}
+			return synthKeyMsg{key: tea.KeyPressMsg{Code: runes[0], Text: k}}
 		})
 	}
 	return tea.Sequence(cmds...)
