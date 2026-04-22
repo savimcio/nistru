@@ -28,6 +28,15 @@ jobs:
           go-version: '1.26.x'
           cache: true
 
+      - name: Verify tag is on master
+        run: |
+          git fetch origin master --depth=100
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "::error::Tag ${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on master. Refusing to release."
+            exit 1
+          fi
+          echo "Tag ${GITHUB_REF_NAME} → ${GITHUB_SHA} is an ancestor of origin/master; proceeding."
+
       - name: Run goreleaser
         uses: goreleaser/goreleaser-action@v7
         with:
