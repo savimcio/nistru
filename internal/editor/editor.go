@@ -9,9 +9,9 @@ import (
 // calling newEditor("", "") without a config handy. The fields default to
 // the built-in keymap and enabled relative numbers when zero-valued.
 //
-// Note: Keymap is currently plumbed through for future use. The adapter's
-// interceptKey uses a hardcoded Ctrl+Z/Y/X/C/V mapping; wiring the user's
-// keymap into the adapter is a follow-up task (see the Keymap field below).
+// Keymap is consumed inside the adapter's interceptKey — user-rebound
+// Undo/Redo/Cut/Copy/Paste keys take effect there instead of at the Model
+// layer, which only handles app-level globals (Save/Quit/Palette/FocusNext).
 type editorOpts struct {
 	Keymap          config.Keymap
 	RelativeNumbers bool
@@ -40,8 +40,8 @@ func newEditor(content, path string, opts ...*editorOpts) Editor {
 	if len(opts) > 0 {
 		o = opts[0]
 	}
-	_, relNums := resolveEditorOpts(o)
-	return newGoeditorAdapter(path, content, relNums)
+	km, relNums := resolveEditorOpts(o)
+	return newGoeditorAdapter(path, content, relNums, km)
 }
 
 // resolveEditorOpts returns the effective keymap + relative-numbers setting

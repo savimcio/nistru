@@ -6,6 +6,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/ionut-t/goeditor"
+	"github.com/savimcio/nistru/internal/config"
 )
 
 // goeditorAdapter wraps a goeditor.Model and exposes it behind the narrow
@@ -23,6 +24,12 @@ import (
 type goeditorAdapter struct {
 	inner    goeditor.Model
 	modeHint Mode // stashed ModeCommand since goeditor's normal mode doesn't track it
+	// keymap is the user's resolved action→key binding. interceptKey uses it
+	// to recognise user-configured Undo/Redo/Cut/Copy/Paste keys, not the
+	// hard-coded ctrl+z/y/x/c/v strings. May be nil in hand-constructed test
+	// adapters — the interceptor falls back to DefaultKeymap via km.Lookup in
+	// that case (Lookup itself handles the nil receiver).
+	keymap config.Keymap
 	// trailingNL remembers whether the most recent SetContent ended with '\n'.
 	// goeditor's own buffer drops trailing newlines (SetContent only appends
 	// the final rune slice if it is non-empty, and GetCurrentContent joins
@@ -46,7 +53,11 @@ var _ Editor = (*goeditorAdapter)(nil)
 // first WindowSizeMsg. path is currently unused (goeditor has no filename
 // concept exposed through its public API); we keep it in the signature to
 // parallel the old newEditor shape so M.B can slot this in without churn.
-func newGoeditorAdapter(path, content string, relativeNumbers bool) *goeditorAdapter {
+//
+// keymap supplies the user's Undo/Redo/Cut/Copy/Paste bindings. A nil keymap
+// means "use the built-in defaults" — interceptKey calls config.Keymap.Lookup,
+// which handles the nil receiver by returning DefaultKeymap entries.
+func newGoeditorAdapter(path, content string, relativeNumbers bool, keymap config.Keymap) *goeditorAdapter {
 	_ = path // reserved — goeditor has no SetFilename equivalent; kept for call-site parity
 	e := goeditor.New(0, 0)
 	e.ShowRelativeLineNumbers(relativeNumbers)
@@ -57,7 +68,11 @@ func newGoeditorAdapter(path, content string, relativeNumbers bool) *goeditorAda
 	// outer Model swap focus to the tree via ad-hoc Blur/Focus calls if
 	// needed (currently the tree's KeyEvent bypass keeps goeditor focused).
 	e.Focus()
-	return &goeditorAdapter{inner: e, trailingNL: strings.HasSuffix(content, "\n")}
+	return &goeditorAdapter{
+		inner:      e,
+		keymap:     keymap,
+		trailingNL: strings.HasSuffix(content, "\n"),
+	}
 }
 
 func (a *goeditorAdapter) Init() tea.Cmd { return a.inner.Init() }
@@ -217,28 +232,33 @@ func (a *goeditorAdapter) cmdEnterNormal() tea.Cmd {
 	}
 }
 
-// interceptKey inspects a KeyPressMsg for nistru's bound Ctrl shortcuts and
-// returns a tea.Cmd + true when the key should NOT reach goeditor. Returns
-// (nil, false) for anything we want goeditor to handle natively.
+// interceptKey inspects a KeyPressMsg for nistru's bound editor shortcuts
+// and returns a tea.Cmd + true when the key should NOT reach goeditor.
+// Returns (nil, false) for anything we want goeditor to handle natively.
 //
-// Keys matched here are matched by their String() form so user-configurable
-// bindings (via km.Lookup) can be wired in by M.B — for now we match the
-// built-in defaults (ctrl+z / ctrl+y / ctrl+x / ctrl+c / ctrl+v).
+// Keys are matched by their String() form against the user's keymap
+// (a.keymap). Users who rebind e.g. undo to ctrl+u get that binding honored
+// here; the old ctrl+z/y/x/c/v defaults are NO LONGER hard-coded — they take
+// effect only when the resolved keymap happens to point at them.
 //
 // Cut/Copy/Paste synth vim motions (dd / yy / p). The sequence first
 // transitions to Normal mode to avoid "d" / "y" / "p" being treated as
 // literal insertions when the user was in Insert mode.
 func (a *goeditorAdapter) interceptKey(km tea.KeyPressMsg) (tea.Cmd, bool) {
-	switch km.String() {
-	case "ctrl+z":
+	key := km.String()
+	// config.Keymap.Lookup handles a nil receiver by falling back to the
+	// built-in DefaultKeymap, so test adapters constructed without a keymap
+	// still get sensible defaults.
+	switch key {
+	case a.keymap.Lookup(config.ActionUndo):
 		return a.Undo(), true
-	case "ctrl+y":
+	case a.keymap.Lookup(config.ActionRedo):
 		return a.Redo(), true
-	case "ctrl+x":
+	case a.keymap.Lookup(config.ActionCutLine):
 		return a.synthVimMotion("d", "d"), true
-	case "ctrl+c":
+	case a.keymap.Lookup(config.ActionCopyLine):
 		return a.synthVimMotion("y", "y"), true
-	case "ctrl+v":
+	case a.keymap.Lookup(config.ActionPaste):
 		return a.synthVimMotion("p"), true
 	}
 	return nil, false

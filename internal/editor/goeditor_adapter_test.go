@@ -4,13 +4,14 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/savimcio/nistru/internal/config"
 )
 
 // -----------------------------------------------------------------------------
 // Round-trip: SetContent → Content.
 
 func TestGoeditorAdapter_ContentRoundTrip(t *testing.T) {
-	a := newGoeditorAdapter("", "abc", false)
+	a := newGoeditorAdapter("", "abc", false, nil)
 	if got := a.Content(); got != "abc" {
 		t.Fatalf("after constructor: Content() = %q, want %q", got, "abc")
 	}
@@ -26,7 +27,7 @@ func TestGoeditorAdapter_ContentRoundTrip(t *testing.T) {
 // back; Command maps to Normal with a dispatch-message cmd.
 
 func TestGoeditorAdapter_ModeRoundTrip(t *testing.T) {
-	a := newGoeditorAdapter("", "x", false)
+	a := newGoeditorAdapter("", "x", false, nil)
 
 	cases := []struct {
 		name string
@@ -54,7 +55,7 @@ func TestGoeditorAdapter_ModeRoundTrip(t *testing.T) {
 // slot, so we map to Normal and emit a status-message cmd so the UI can
 // still flash a ":" prompt.
 func TestGoeditorAdapter_ModeCommandMapsToNormalWithStatusCmd(t *testing.T) {
-	a := newGoeditorAdapter("", "x", false)
+	a := newGoeditorAdapter("", "x", false, nil)
 
 	cmd := a.SetMode(ModeCommand)
 	if cmd == nil {
@@ -73,7 +74,7 @@ func TestGoeditorAdapter_ModeCommandMapsToNormalWithStatusCmd(t *testing.T) {
 // (handled=true) before reaching goeditor.
 
 func TestGoeditorAdapter_InterceptsCtrlZ(t *testing.T) {
-	a := newGoeditorAdapter("", "abc", false)
+	a := newGoeditorAdapter("", "abc", false, nil)
 
 	km := tea.KeyPressMsg{Code: 'z', Mod: tea.ModCtrl}
 	cmd, handled := a.interceptKey(km)
@@ -99,7 +100,7 @@ func TestGoeditorAdapter_InterceptsAllBoundCtrlKeys(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			a := newGoeditorAdapter("", "x", false)
+			a := newGoeditorAdapter("", "x", false, nil)
 			cmd, handled := a.interceptKey(tc.key)
 			if !handled {
 				t.Fatalf("interceptKey(%v) handled = false, want true", tc.key.String())
@@ -111,12 +112,45 @@ func TestGoeditorAdapter_InterceptsAllBoundCtrlKeys(t *testing.T) {
 	}
 }
 
+// Regression for F.2: the adapter must honour the user's keymap, not the
+// built-in Ctrl+Z/Y/X/C/V defaults. When a user rebinds undo to ctrl+u, the
+// new binding fires and the OLD default (ctrl+z) falls through to goeditor
+// as a regular keystroke (i.e. the interceptor does not claim it).
+func TestGoeditorAdapter_HonoursRebounddUndoKey(t *testing.T) {
+	km := config.DefaultKeymap()
+	km[config.ActionUndo] = "ctrl+u"
+	// Also clear the old default to avoid a stale duplicate; Validate handles
+	// that in production but we want the intent crisp here.
+	a := newGoeditorAdapter("", "x", false, km)
+
+	// New binding: ctrl+u must fire undo.
+	newBind := tea.KeyPressMsg{Code: 'u', Mod: tea.ModCtrl}
+	cmd, handled := a.interceptKey(newBind)
+	if !handled {
+		t.Fatalf("interceptKey(ctrl+u) handled = false, want true after rebinding undo to ctrl+u")
+	}
+	if cmd == nil {
+		t.Fatalf("interceptKey(ctrl+u) cmd = nil, want non-nil (undo sequence)")
+	}
+
+	// Old default: ctrl+z must NOT fire undo anymore — it falls through.
+	// (ctrl+z is no longer bound to any action in this keymap.)
+	oldDefault := tea.KeyPressMsg{Code: 'z', Mod: tea.ModCtrl}
+	cmd, handled = a.interceptKey(oldDefault)
+	if handled {
+		t.Errorf("interceptKey(ctrl+z) handled = true after rebinding undo away from ctrl+z; keymap must be authoritative")
+	}
+	if cmd != nil {
+		t.Errorf("interceptKey(ctrl+z) cmd != nil on pass-through")
+	}
+}
+
 // Unbound keys must NOT be intercepted — they pass through to goeditor. We
 // check via the lower-level interceptKey rather than Update, because driving
 // Update for a plain 'a' boots goeditor's full insert-mode machinery (which
 // is goeditor's business to test, not ours).
 func TestGoeditorAdapter_DoesNotInterceptUnboundKey(t *testing.T) {
-	a := newGoeditorAdapter("", "x", false)
+	a := newGoeditorAdapter("", "x", false, nil)
 
 	cases := []tea.KeyPressMsg{
 		{Code: 'a', Text: "a"},
@@ -144,7 +178,7 @@ func TestGoeditorAdapter_DoesNotInterceptUnboundKey(t *testing.T) {
 // after SetContent is coherent (non-negative, inside the buffer).
 
 func TestGoeditorAdapter_CursorRowColAfterSetContent(t *testing.T) {
-	a := newGoeditorAdapter("", "line1\nline2", false)
+	a := newGoeditorAdapter("", "line1\nline2", false, nil)
 
 	row, col := a.CursorRowCol()
 	if row < 0 || col < 0 {
@@ -165,7 +199,7 @@ func TestGoeditorAdapter_CursorRowColAfterSetContent(t *testing.T) {
 // regressions where Undo/Redo accidentally return nil.
 
 func TestGoeditorAdapter_UndoReturnsNonNilCmd(t *testing.T) {
-	a := newGoeditorAdapter("", "x", false)
+	a := newGoeditorAdapter("", "x", false, nil)
 
 	if cmd := a.Undo(); cmd == nil {
 		t.Fatalf("Undo() = nil, want non-nil tea.Cmd")
@@ -173,7 +207,7 @@ func TestGoeditorAdapter_UndoReturnsNonNilCmd(t *testing.T) {
 }
 
 func TestGoeditorAdapter_RedoReturnsNonNilCmd(t *testing.T) {
-	a := newGoeditorAdapter("", "x", false)
+	a := newGoeditorAdapter("", "x", false, nil)
 
 	if cmd := a.Redo(); cmd == nil {
 		t.Fatalf("Redo() = nil, want non-nil tea.Cmd")
@@ -221,7 +255,7 @@ func TestGoeditorAdapter_UndoSynthesisesLowercaseU(t *testing.T) {
 // requested runes in order. We execute the inner cmds and collect the
 // resulting messages to verify.
 func TestGoeditorAdapter_SynthVimMotionEmitsKeysInOrder(t *testing.T) {
-	a := newGoeditorAdapter("", "x", false)
+	a := newGoeditorAdapter("", "x", false, nil)
 
 	cmd := a.synthVimMotion("d", "d")
 	if cmd == nil {
@@ -245,14 +279,14 @@ func TestGoeditorAdapter_ConstructsAtZeroSize(t *testing.T) {
 			t.Fatalf("newGoeditorAdapter panicked at zero size: %v", r)
 		}
 	}()
-	a := newGoeditorAdapter("", "hello", false)
+	a := newGoeditorAdapter("", "hello", false, nil)
 	_ = a.View() // must not panic
 }
 
 // SetSize should not panic on subsequent grown sizes, and the adapter
 // satisfies the Editor interface contract (compile-time check via var _).
 func TestGoeditorAdapter_SetSizeDoesNotPanic(t *testing.T) {
-	a := newGoeditorAdapter("", "hello", false)
+	a := newGoeditorAdapter("", "hello", false, nil)
 	if cmd := a.SetSize(80, 24); cmd != nil {
 		t.Errorf("SetSize returned non-nil cmd; adapter contract says nil")
 	}
