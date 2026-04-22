@@ -3,7 +3,7 @@ package editor
 import (
 	"fmt"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/savimcio/nistru/internal/config"
 )
@@ -19,7 +19,10 @@ func Run(path string, cfg *config.Config) error {
 	if err != nil {
 		return err
 	}
-	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	// AltScreen and MouseCellMotion used to be Program-level options; in
+	// bubbletea v2 they move to declarative fields on the tea.View returned
+	// from Model.View(). See Model.View in model.go.
+	p := tea.NewProgram(m)
 	final, err := p.Run()
 	if err != nil {
 		return err

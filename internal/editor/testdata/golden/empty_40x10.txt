@@ -1,11 +1,11 @@
-▾ 001/                        │   1
-└── README                    │
-                              │
-                              │
-                              │
-                              │
-                              │
-                              │
-                              │ NORMAL
-                               1:1
+▾ 001/                       │   1
+└── README                   │
+                             │
+                             │
+                             │
+                             │
+                             │
+                             │ NORMAL
+                             │1/1
+
 [NORMAL]           (no file)

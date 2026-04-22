@@ -1,9 +1,6 @@
 package editor
 
 import (
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/kujtimiihoxha/vimtea"
-
 	"github.com/savimcio/nistru/internal/config"
 )
 
@@ -11,16 +8,19 @@ import (
 // pointer means "use defaults" — which keeps hand-constructed test Models
 // calling newEditor("", "") without a config handy. The fields default to
 // the built-in keymap and enabled relative numbers when zero-valued.
+//
+// Note: Keymap is currently plumbed through for future use. The adapter's
+// interceptKey uses a hardcoded Ctrl+Z/Y/X/C/V mapping; wiring the user's
+// keymap into the adapter is a follow-up task (see the Keymap field below).
 type editorOpts struct {
 	Keymap          config.Keymap
 	RelativeNumbers bool
 }
 
-// newEditor constructs a fresh vimtea.Editor and registers the micro-style
-// Ctrl bindings that live inside the editor (Ctrl+Z/Y/X/C/V for undo, redo,
-// cut, copy, paste). Ctrl+S and Ctrl+Q are intercepted at the parent model
-// level — they are app-wide concerns, not editor concerns — so they are NOT
-// registered here.
+// newEditor constructs a fresh Editor (backed by goeditorAdapter) seeded
+// with the given content. The returned value satisfies the package-local
+// Editor interface so the outer Model is decoupled from any specific
+// library.
 //
 // opts (variadic, at most one) supplies the user's keymap and whether the
 // editor renders relative line numbers. Passing no opts is equivalent to
@@ -31,26 +31,17 @@ type editorOpts struct {
 //  1. main.go / initial model construction, with empty content.
 //  2. model.go, when a file is opened from the tree (fresh Editor per open).
 //
-// Because the editor is reconstructed on each open, the bindings below are
-// re-registered every time — a fresh Editor has no user bindings.
-func newEditor(content, path string, opts ...*editorOpts) vimtea.Editor {
+// Ctrl+Z/Y/X/C/V shortcuts are intercepted inside goeditorAdapter.interceptKey
+// — there is no addCtrlBindings step here. The adapter's interception layer
+// runs before goeditor sees the keystroke, so user-level bindings stay
+// consistent across Normal/Insert/Visual without per-mode registration.
+func newEditor(content, path string, opts ...*editorOpts) Editor {
 	var o *editorOpts
 	if len(opts) > 0 {
 		o = opts[0]
 	}
-	km, relNums := resolveEditorOpts(o)
-
-	vopts := []vimtea.EditorOption{
-		vimtea.WithContent(content),
-		vimtea.WithRelativeNumbers(relNums),
-	}
-	if path != "" {
-		vopts = append(vopts, vimtea.WithFileName(path))
-	}
-	e := vimtea.NewEditor(vopts...)
-
-	addCtrlBindings(e, km)
-	return e
+	_, relNums := resolveEditorOpts(o)
+	return newGoeditorAdapter(path, content, relNums)
 }
 
 // resolveEditorOpts returns the effective keymap + relative-numbers setting
@@ -67,107 +58,4 @@ func resolveEditorOpts(o *editorOpts) (config.Keymap, bool) {
 		km = config.DefaultKeymap()
 	}
 	return km, o.RelativeNumbers
-}
-
-// addCtrlBindings registers micro-style Ctrl shortcuts inside the editor.
-// These bindings intentionally duplicate across Normal, Insert and Visual
-// modes so the shortcuts work the same regardless of where the user is.
-//
-// Ctrl+Z and Ctrl+Y use Buffer.Undo / Buffer.Redo directly — vimtea exposes
-// both on the Buffer interface.
-//
-// Ctrl+X / Ctrl+C / Ctrl+V synthesize the equivalent vim key sequences
-// (dd / yy / p) as tea.KeyMsg values returned through tea.Sequence. Two
-// subtleties handled here:
-//
-//  1. The synthesized keys must be interpreted in Normal mode. If the caller
-//     is in Insert mode, "d"/"y"/"p" are literal characters — so we prepend
-//     editor.SetMode(ModeNormal) to the sequence. For v1 we leave the editor
-//     in Normal afterwards, which matches vim's own behaviour for these
-//     operators.
-//  2. tea.Sequence executes its commands strictly in order with no
-//     interleaving of other messages, so "dd" cannot be corrupted into "dj"
-//     or "dk" by racing user keystrokes.
-//
-// Buffer does not expose direct DeleteLine/YankLine/Paste primitives, so the
-// tea.Sequence-through-the-key-path remains the only way to reach vimtea's
-// motion engine from a binding handler.
-//
-// Keys are resolved via km.Lookup(action) so a user can rebind any of them
-// through the config's [keymap] table. A nil or incomplete Keymap falls back
-// to the built-in defaults (see config.Keymap.Lookup).
-func addCtrlBindings(e vimtea.Editor, km config.Keymap) {
-	modes := []vimtea.EditorMode{vimtea.ModeNormal, vimtea.ModeInsert, vimtea.ModeVisual}
-
-	undoKey := km.Lookup(config.ActionUndo)
-	redoKey := km.Lookup(config.ActionRedo)
-	cutKey := km.Lookup(config.ActionCutLine)
-	copyKey := km.Lookup(config.ActionCopyLine)
-	pasteKey := km.Lookup(config.ActionPaste)
-
-	for _, mode := range modes {
-		e.AddBinding(vimtea.KeyBinding{
-			Key:         undoKey,
-			Mode:        mode,
-			Description: "undo",
-			Handler: func(buf vimtea.Buffer) tea.Cmd {
-				return buf.Undo()
-			},
-		})
-
-		e.AddBinding(vimtea.KeyBinding{
-			Key:         redoKey,
-			Mode:        mode,
-			Description: "redo",
-			Handler: func(buf vimtea.Buffer) tea.Cmd {
-				return buf.Redo()
-			},
-		})
-
-		e.AddBinding(vimtea.KeyBinding{
-			Key:         cutKey,
-			Mode:        mode,
-			Description: "cut line",
-			Handler: func(buf vimtea.Buffer) tea.Cmd {
-				return synthVimMotion(e, "d", "d")
-			},
-		})
-
-		e.AddBinding(vimtea.KeyBinding{
-			Key:         copyKey,
-			Mode:        mode,
-			Description: "copy line",
-			Handler: func(buf vimtea.Buffer) tea.Cmd {
-				return synthVimMotion(e, "y", "y")
-			},
-		})
-
-		e.AddBinding(vimtea.KeyBinding{
-			Key:         pasteKey,
-			Mode:        mode,
-			Description: "paste",
-			Handler: func(buf vimtea.Buffer) tea.Cmd {
-				return synthVimMotion(e, "p")
-			},
-		})
-	}
-}
-
-// synthVimMotion returns a tea.Cmd that first switches the editor to Normal
-// mode and then emits the given runes as key messages in order, so the
-// editor's vim engine receives a well-formed motion regardless of the mode
-// the user was in when the Ctrl shortcut fired.
-//
-// tea.Sequence guarantees strict ordering with no interleaved messages, so
-// multi-key motions like "dd" / "yy" cannot be corrupted by concurrent user
-// input.
-func synthVimMotion(e vimtea.Editor, keys ...string) tea.Cmd {
-	cmds := make([]tea.Cmd, 0, 1+len(keys))
-	cmds = append(cmds, e.SetMode(vimtea.ModeNormal))
-	for _, k := range keys {
-		cmds = append(cmds, func() tea.Msg {
-			return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)}
-		})
-	}
-	return tea.Sequence(cmds...)
 }

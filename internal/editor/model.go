@@ -9,9 +9,8 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/kujtimiihoxha/vimtea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/savimcio/nistru/internal/config"
 	"github.com/savimcio/nistru/internal/plugins/autoupdate"
@@ -59,8 +58,8 @@ type statusSegment struct {
 }
 
 // Model is the top-level app model. It owns the plugin host (which owns the
-// left-pane plugin), the vimtea editor, focus routing, window size, and the
-// autosave/change-debounce bookkeeping.
+// left-pane plugin), the Editor (goeditor-backed via goeditorAdapter), focus
+// routing, window size, and the autosave/change-debounce bookkeeping.
 type Model struct {
 	root string
 	cfg  *config.Config
@@ -77,7 +76,7 @@ type Model struct {
 	// plugin name for in-place updates.
 	statusSegments []statusSegment
 
-	editor vimtea.Editor
+	editor Editor
 	focus  focus
 
 	width  int
@@ -203,10 +202,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.lastPaneH = contentH
 			}
 		}
-		newEd, cmd := m.editor.SetSize(editorW, contentH)
-		if e, ok := newEd.(vimtea.Editor); ok {
-			m.editor = e
-		}
+		cmd := m.editor.SetSize(editorW, contentH)
 		return m, cmd
 
 	case openFileRequestMsg:
@@ -238,7 +234,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		effs := m.host.Emit(plugin.DidChange{
 			Path: m.openPath,
-			Text: m.editor.GetBuffer().Text(),
+			Text: m.editor.Content(),
 		})
 		cmd := m.applyEffects(effs)
 		return m, cmd
@@ -268,7 +264,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// v1: model logic doesn't use plugin responses directly. Re-arm.
 		return m, m.host.Recv()
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
 
@@ -418,11 +414,7 @@ func (m *Model) handlePluginReq(msg plugin.PluginReqMsg) (tea.Model, tea.Cmd) {
 		m.editor = newEditor(p.Text, p.Path, m.editorOptsFromCfg())
 		contentH := m.height - statusBarLines
 		contentH = max(contentH, 1)
-		if newEd, _ := m.editor.SetSize(m.editorWidth(), contentH); newEd != nil {
-			if e, ok := newEd.(vimtea.Editor); ok {
-				m.editor = e
-			}
-		}
+		_ = m.editor.SetSize(m.editorWidth(), contentH)
 		m.lastText = p.Text
 		m.dirty = false
 		m.saveGen++
@@ -502,7 +494,7 @@ func filterSegments(s []statusSegment, pluginName string) []statusSegment {
 // When the command palette is open it consumes every key event before the
 // globals run, so Ctrl+S / Ctrl+Q are safe from being triggered by a user
 // typing into the palette's query field.
-func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.palette.open {
 		return m.handlePaletteKey(msg)
 	}
@@ -552,8 +544,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // executes the selected command through the plugin host. Always returns
 // immediately — while the palette is open, the editor and left pane do not
 // see keyboard input.
-func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	closed, activated := m.palette.HandleKey(msg.String(), msg.Runes)
+func (m *Model) handlePaletteKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	closed, activated := m.palette.HandleKey(msg.String(), []rune(msg.Text))
 	if activated != nil {
 		result := m.host.ExecuteCommand(activated.ID, nil)
 		var cmd tea.Cmd
@@ -605,7 +597,7 @@ func (m *Model) forwardToFocused(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.leftPane == nil {
 			return m, nil
 		}
-		key, ok := msg.(tea.KeyMsg)
+		key, ok := msg.(tea.KeyPressMsg)
 		if !ok {
 			// No legacy tree.Update — non-key messages are dropped when the
 			// tree has focus. Panes receive non-key state exclusively via
@@ -616,15 +608,13 @@ func (m *Model) forwardToFocused(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.applyEffects(effs)
 	}
 
-	newEd, cmd := m.editor.Update(msg)
-	if e, ok := newEd.(vimtea.Editor); ok {
-		m.editor = e
-	}
+	var cmd tea.Cmd
+	m.editor, cmd = m.editor.Update(msg)
 
 	// Autosave + change-tick check — only meaningful when we have a file
 	// open.
 	if m.openPath != "" {
-		cur := m.editor.GetBuffer().Text()
+		cur := m.editor.Content()
 		if cur != m.lastText {
 			m.dirty = true
 			m.saveGen++
@@ -640,13 +630,15 @@ func (m *Model) forwardToFocused(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// keyEventFromTea converts a bubbletea KeyMsg into a transport-neutral
-// plugin.KeyEvent that panes can consume without importing bubbletea.
-func keyEventFromTea(msg tea.KeyMsg) plugin.KeyEvent {
+// keyEventFromTea converts a bubbletea v2 KeyPressMsg into a transport-neutral
+// plugin.KeyEvent that panes can consume without importing bubbletea. In v2
+// the old msg.Runes / msg.Alt fields are replaced by msg.Text (string) and
+// msg.Mod (KeyMod) respectively.
+func keyEventFromTea(msg tea.KeyPressMsg) plugin.KeyEvent {
 	return plugin.KeyEvent{
 		Key:   msg.String(),
-		Runes: msg.Runes,
-		Alt:   msg.Alt,
+		Runes: []rune(msg.Text),
+		Alt:   msg.Mod.Contains(tea.ModAlt),
 	}
 }
 
@@ -706,9 +698,9 @@ func (m *Model) applyEffects(effs []plugin.Effect) tea.Cmd {
 // — we duplicate the loop here rather than extract a helper, because the
 // one-line format is trivial and both call sites stay independent.
 //
-// A vimtea.Editor baked in its opts at construction time (relative numbers
-// and the Ctrl-binding keymap), so for those specific knobs we detect a
-// change and rebuild the editor instance in place. Content and file path
+// The Editor bakes in its opts at construction time (relative numbers and,
+// in future, the Ctrl-binding keymap), so for those specific knobs we detect
+// a change and rebuild the editor instance in place. Content and file path
 // are preserved; cursor position and vim mode are reset — acceptable v1
 // tradeoff, called out in the return contract.
 func (m *Model) reloadConfig() tea.Cmd {
@@ -740,15 +732,11 @@ func (m *Model) reloadConfig() tea.Cmd {
 
 	var initCmd tea.Cmd
 	if m.cfg != nil && editorKnobsChanged(oldKnobs, snapshotEditorKnobs(m.cfg)) {
-		buf := m.editor.GetBuffer().Text()
+		buf := m.editor.Content()
 		m.editor = newEditor(buf, m.openPath, m.editorOptsFromCfg())
 		contentH := m.height - statusBarLines
 		contentH = max(contentH, 1)
-		if newEd, _ := m.editor.SetSize(m.editorWidth(), contentH); newEd != nil {
-			if e, ok := newEd.(vimtea.Editor); ok {
-				m.editor = e
-			}
-		}
+		_ = m.editor.SetSize(m.editorWidth(), contentH)
 		initCmd = m.editor.Init()
 	}
 
@@ -762,8 +750,8 @@ func (m *Model) reloadConfig() tea.Cmd {
 	return msg
 }
 
-// editorKnobs is the subset of config.Config that the vimtea editor bakes in
-// at construction time — changing any of these means we must rebuild the
+// editorKnobs is the subset of config.Config that the Editor bakes in at
+// construction time — changing any of these means we must rebuild the
 // editor instance for the change to take effect.
 type editorKnobs struct {
 	relativeNumbers bool
@@ -846,11 +834,7 @@ func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 	// Push the current size into the new editor instance.
 	contentH := m.height - statusBarLines
 	contentH = max(contentH, 1)
-	if newEd, _ := m.editor.SetSize(m.editorWidth(), contentH); newEd != nil {
-		if e, ok := newEd.(vimtea.Editor); ok {
-			m.editor = e
-		}
-	}
+	_ = m.editor.SetSize(m.editorWidth(), contentH)
 
 	m.openPath = path
 	m.lastText = content
@@ -901,7 +885,7 @@ func (m *Model) flushNow() error {
 	if m.openPath == "" || !m.dirty {
 		return nil
 	}
-	cur := m.editor.GetBuffer().Text()
+	cur := m.editor.Content()
 	if err := atomicWriteFile(m.openPath, []byte(cur)); err != nil {
 		return err
 	}
@@ -914,7 +898,25 @@ func (m *Model) flushNow() error {
 	return nil
 }
 
-func (m *Model) View() string {
+// View composes the final terminal frame. In bubbletea v2 View returns a
+// tea.View struct whose Content holds the rendered body and whose declarative
+// fields (AltScreen, MouseMode, etc.) replace the old Program-level options.
+// We always request the alt-screen and cell-motion mouse events so the
+// runtime matches the v1 behaviour that used to live in run.go.
+func (m *Model) View() tea.View {
+	return tea.View{
+		Content:   m.renderFrame(),
+		AltScreen: true,
+		MouseMode: tea.MouseModeCellMotion,
+	}
+}
+
+// renderFrame produces the string body of the view. Split out from View so
+// tests and internal callers can inspect the raw string without having to
+// reach through the tea.View wrapper. goeditor handles width natively, so
+// there is no defensive clampPaneBox step here any more — the previous
+// stopgap is removed as part of the migration.
+func (m *Model) renderFrame() string {
 	if m.width == 0 || m.height == 0 {
 		// Pre-init render — the real view waits for the first WindowSizeMsg.
 		return ""
@@ -952,8 +954,10 @@ func (m *Model) View() string {
 		if m.focus == focusTree {
 			treeStyle = treeStyle.BorderForeground(lipgloss.Color("205"))
 		}
-		treePane := treeStyle.Render(m.leftPane.Render(tw, contentH))
-		editorPane := editorStyle.Render(m.editor.View())
+		rawTree := m.leftPane.Render(tw, contentH)
+		rawEditor := m.editor.View()
+		treePane := treeStyle.Render(rawTree)
+		editorPane := editorStyle.Render(rawEditor)
 		content = lipgloss.JoinHorizontal(lipgloss.Top, treePane, editorPane)
 	} else {
 		content = editorStyle.Render(m.editor.View())
@@ -968,7 +972,7 @@ func (m *Model) View() string {
 // width m.width. Plugin segments are dropped right-to-left if space is
 // insufficient after truncating the path.
 func (m *Model) renderStatusBar() string {
-	modeText := "[" + modeName(m.editor.GetMode()) + "]"
+	modeText := "[" + modeName(m.editor.Mode()) + "]"
 
 	path := m.openPath
 	if path == "" {
@@ -1065,15 +1069,15 @@ func (m *Model) renderStatusBar() string {
 	return lipgloss.NewStyle().Width(m.width).Render(row)
 }
 
-func modeName(m vimtea.EditorMode) string {
+func modeName(m Mode) string {
 	switch m {
-	case vimtea.ModeNormal:
+	case ModeNormal:
 		return "NORMAL"
-	case vimtea.ModeInsert:
+	case ModeInsert:
 		return "INSERT"
-	case vimtea.ModeVisual:
+	case ModeVisual:
 		return "VISUAL"
-	case vimtea.ModeCommand:
+	case ModeCommand:
 		return "COMMAND"
 	default:
 		return "?"

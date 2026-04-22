@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/savimcio/nistru/internal/plugins/autoupdate"
 	"github.com/savimcio/nistru/internal/plugins/treepane"
