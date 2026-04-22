@@ -35,8 +35,8 @@ const (
 // plumb tea.View through this interface.
 //
 // SetSize returns only tea.Cmd — the adapter mutates its inner model in
-// place, which keeps call sites simpler than the previous vimtea pattern
-// that returned (tea.Model, tea.Cmd) and forced callers to type-assert.
+// place, which keeps call sites simpler than returning (tea.Model, tea.Cmd)
+// and forcing callers to type-assert.
 type Editor interface {
 	Init() tea.Cmd
 	Update(msg tea.Msg) (Editor, tea.Cmd)

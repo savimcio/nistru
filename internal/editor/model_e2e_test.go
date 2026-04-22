@@ -456,7 +456,7 @@ func TestE2E_EditAutosaveToDisk(t *testing.T) {
 		t.Fatalf("expected file to diverge from seed after autosave; still %q", last)
 	}
 	// Soft assertion on 'hello' presence — log only, since the exact
-	// interleaving of tea messages vs. vimtea mode transitions isn't
+	// interleaving of tea messages vs. editor mode transitions isn't
 	// deterministic enough to require an exact match in an e2e test.
 	if !strings.Contains(last, "hello") {
 		t.Logf("note: file content %q does not contain 'hello' verbatim; autosave still fired", last)
@@ -837,10 +837,10 @@ func TestE2E_OutOfProcGofmtReformatsBuffer(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// The original test inserted an empty string via the old vimtea buffer
-	// API to bump dirty state. With the goeditor adapter we just mark the
-	// model dirty — the content already contains what the plugin will
-	// reformat on DidSave.
+	// We mark the model dirty directly — the content already contains what
+	// the plugin will reformat on DidSave, and goeditor's Editor interface
+	// doesn't expose an InsertAt-style seam for bumping dirty state from a
+	// test.
 	m.dirty = true
 	_, _ = m.Update(forceSaveMsg{})
 
