@@ -14,11 +14,36 @@ A minimal terminal text editor with a file-tree sidebar, modal vim-style editing
 
 ## Install
 
+### Homebrew (macOS + Linux)
+
+```sh
+brew install savimcio/homebrew-tap/nistru
+```
+
+The formula tracks stable releases; `brew upgrade nistru` picks up new versions.
+
+### Pre-built binaries
+
+Archives for linux/darwin/windows × amd64/arm64 are published on the [Releases page](https://github.com/savimcio/nistru/releases) (windows/arm64 excepted). Each release ships a `checksums.txt` (SHA-256) alongside the archives.
+
+### Debian / RPM
+
+```sh
+# Debian / Ubuntu (pick the arch matching your system)
+curl -LO https://github.com/savimcio/nistru/releases/latest/download/nistru_<version>_linux_amd64.deb
+sudo dpkg -i nistru_<version>_linux_amd64.deb
+
+# Fedora / RHEL
+sudo rpm -i https://github.com/savimcio/nistru/releases/download/v<version>/nistru_<version>_linux_amd64.rpm
+```
+
+### From source
+
 ```sh
 go install github.com/savimcio/nistru/cmd/nistru@latest
 ```
 
-Or build from source:
+Or build a checkout:
 
 ```sh
 git clone https://github.com/savimcio/nistru.git
@@ -140,6 +165,8 @@ Four palette commands (`Ctrl+P`) manage settings:
 ## Auto-update
 
 Nistru ships with a first-party `autoupdate` plugin that watches GitHub Releases for newer versions. It is enabled by default, runs quietly in the background, and never swaps the binary without explicit palette invocation.
+
+**Installed via a package manager?** If you installed through Homebrew, `.deb`, or `.rpm`, update through that channel instead — the built-in updater targets the single-binary install path (`go install` or a direct archive download).
 
 **What it does.** Once an hour, the plugin issues a single unauthenticated `GET` to `api.github.com/repos/savimcio/nistru/releases`. If a newer version is available, a status-bar segment announces it; palette commands let you install it, roll back, switch channels, or view release notes. No telemetry is collected and no data is sent outbound beyond the GitHub API request itself.
 

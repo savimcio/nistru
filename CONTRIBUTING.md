@@ -85,6 +85,34 @@ One logical change per commit. If you've stacked work, split it — smaller PRs 
 - Package doc comments (`// Package foo ...`) on every exported package.
 - Write no comments unless the *why* is non-obvious. Don't narrate what the code already says.
 
+## Releasing
+
+Maintainer-facing. Releases are tag-triggered: pushing any `v*` tag fires the GoReleaser workflow, which cross-builds archives, packages, and the Homebrew formula.
+
+**Cutting a release.** From a merged-to-master commit:
+
+```sh
+git checkout master
+git pull origin master
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+Do **not** push `v*` tags from feature branches. The workflow triggers on any `v*` tag push regardless of SHA and will happily release from wherever you pointed the tag.
+
+**Prereleases.** Tags with a SemVer prerelease identifier (`vX.Y.Z-rc.1`, `vX.Y.Z-beta.2`, etc.) are detected by `release.prerelease: auto` in `.goreleaser.yaml` and published with `prerelease: true` on GitHub. That flag is what feeds the `autoupdate` plugin's `dev` channel.
+
+**Homebrew tap.** Stable tags (no prerelease identifier) publish `Formula/nistru.rb` to [`savimcio/homebrew-tap`](https://github.com/savimcio/homebrew-tap) using the `HOMEBREW_TAP_TOKEN` secret — a fine-grained PAT scoped to that tap, stored as a repo secret on `savimcio/nistru`. Prereleases skip the tap via `brews.skip_upload: auto`.
+
+**Local validation before tagging.**
+
+| Command | Effect |
+|---|---|
+| `make release-check` | lints the goreleaser config without building |
+| `make release-snapshot` | full dry-run build into `dist/`; produces every artifact the real pipeline would |
+
+Run both before pushing a tag. A snapshot that fails locally will fail in CI.
+
 ## Bug reports and features
 
 Use the GitHub issue forms. The bug form asks for the Nistru commit, Go version, OS, and terminal — fill them in; those four answers unblock most triage.
