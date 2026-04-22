@@ -22,6 +22,46 @@ func TestGoeditorAdapter_ContentRoundTrip(t *testing.T) {
 	}
 }
 
+// Regression for F.3: Content() used to re-append a trailing newline when
+// the most recent SetContent had one, based on a memoised flag that never
+// updated as the user edited. A user who intentionally deleted the EOF
+// newline could not persist that change — Content() re-added it. The fix is
+// to return goeditor's buffer verbatim.
+//
+// goeditor's own SetContent drops trailing newlines at parse time, so the
+// round-trip shape for "hello\n" is "hello" and for "hello" is also "hello".
+// We assert exactly that, documenting the semantic: nistru no longer
+// preserves EOF newlines across the adapter. If goeditor is ever replaced
+// with a buffer that does preserve them, this test should be updated
+// intentionally; it must not silently regress to the old re-append behaviour.
+func TestGoeditorAdapter_ContentDoesNotReappendTrailingNewline(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"trailing newline dropped by goeditor", "hello\n", "hello"},
+		{"no trailing newline stays absent", "hello", "hello"},
+		{"multiline with trailing newline", "line1\nline2\n", "line1\nline2"},
+		{"multiline without trailing newline", "line1\nline2", "line1\nline2"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			a := newGoeditorAdapter("", tc.in, false, nil)
+			if got := a.Content(); got != tc.want {
+				t.Errorf("Content() after constructor(%q) = %q, want %q (no re-append heuristic)", tc.in, got, tc.want)
+			}
+			// SetContent must behave the same way — the old heuristic lived
+			// in SetContent too.
+			a.SetContent(tc.in)
+			if got := a.Content(); got != tc.want {
+				t.Errorf("Content() after SetContent(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Mode round-trip — Normal/Insert/Visual must reflect through goeditor and
 // back; Command maps to Normal with a dispatch-message cmd.

@@ -89,8 +89,14 @@ func TestModel_OpenFileFlow(t *testing.T) {
 		if got.dirty {
 			t.Errorf("dirty should be false after successful open")
 		}
-		if got.lastText != "package main\n\nfunc main() {}\n" {
-			t.Errorf("lastText not seeded from file: got %q", got.lastText)
+		// goeditor's buffer does not preserve the file's trailing newline, so
+		// both lastText (seeded from editor.Content() after SetContent) and
+		// the live editor buffer drop the final '\n'. This is deliberate:
+		// re-adding the newline via a memoised flag caused data-loss bugs for
+		// users who intentionally deleted the EOF newline (see commit history).
+		wantBuf := "package main\n\nfunc main() {}"
+		if got.lastText != wantBuf {
+			t.Errorf("lastText not seeded from file: got %q, want %q", got.lastText, wantBuf)
 		}
 		// Buffer should contain the file contents so a subsequent View() or
 		// change-tick would see them.
@@ -631,7 +637,10 @@ func TestModel_PluginMessagePlumbing(t *testing.T) {
 		if cmd == nil {
 			t.Errorf("buffer/edit should batch editor.Init + host.Recv; got nil")
 		}
-		if got := m.editor.Content(); got != "replaced by plugin\n" {
+		// goeditor drops the trailing newline from SetContent's input, so we
+		// assert against the stripped form. The plugin supplied
+		// "replaced by plugin\n"; the editor buffer holds the prefix.
+		if got := m.editor.Content(); got != "replaced by plugin" {
 			t.Errorf("buffer not replaced; got %q", got)
 		}
 		if m.dirty {

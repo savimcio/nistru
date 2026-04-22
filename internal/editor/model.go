@@ -837,7 +837,12 @@ func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 	_ = m.editor.SetSize(m.editorWidth(), contentH)
 
 	m.openPath = path
-	m.lastText = content
+	// Seed lastText from the editor's actual buffer rather than the raw
+	// file bytes — goeditor does not preserve trailing newlines, so the
+	// raw content and the editor's Content() can differ by one byte on
+	// open. Using the editor's view keeps the dirty-diff honest: a freshly
+	// opened file must not register as modified until the user edits.
+	m.lastText = m.editor.Content()
 	m.dirty = false
 	m.saveGen++   // invalidate any pending save tick from before the open
 	m.changeGen++ // invalidate any pending change tick from before the open

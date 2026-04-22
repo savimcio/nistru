@@ -1,7 +1,6 @@
 package editor
 
 import (
-	"strings"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -30,15 +29,6 @@ type goeditorAdapter struct {
 	// adapters — the interceptor falls back to DefaultKeymap via km.Lookup in
 	// that case (Lookup itself handles the nil receiver).
 	keymap config.Keymap
-	// trailingNL remembers whether the most recent SetContent ended with '\n'.
-	// goeditor's own buffer drops trailing newlines (SetContent only appends
-	// the final rune slice if it is non-empty, and GetCurrentContent joins
-	// with "\n" between lines). We restore the trailing newline in Content()
-	// so disk writes and plugin round-trips preserve the user's file
-	// convention. Updated on SetContent; not touched while the user types —
-	// once the buffer is under the user's fingers, trailing-newline fidelity
-	// is an editor-internal concern.
-	trailingNL bool
 }
 
 // statusDispatchDuration is the default TTL for DispatchMessage. goeditor's
@@ -69,9 +59,8 @@ func newGoeditorAdapter(path, content string, relativeNumbers bool, keymap confi
 	// needed (currently the tree's KeyEvent bypass keeps goeditor focused).
 	e.Focus()
 	return &goeditorAdapter{
-		inner:      e,
-		keymap:     keymap,
-		trailingNL: strings.HasSuffix(content, "\n"),
+		inner:  e,
+		keymap: keymap,
 	}
 }
 
@@ -104,7 +93,6 @@ func (a *goeditorAdapter) SetSize(w, h int) tea.Cmd {
 }
 
 func (a *goeditorAdapter) SetContent(text string) {
-	a.trailingNL = strings.HasSuffix(text, "\n")
 	a.inner.SetContent(text)
 	// goeditor populates its viewport content only from inside Update
 	// (renderVisibleSlice runs after the Update switch). Callers that reach
@@ -122,16 +110,21 @@ func (a *goeditorAdapter) SetContent(text string) {
 // was already called by SetContent; we only need the final render step).
 type renderKickMsg struct{}
 
-// Content returns the current buffer text. goeditor's GetCurrentContent joins
-// lines with "\n" between but drops the trailing newline; we restore it when
-// the most recent SetContent included one so flushNow writes and plugin
-// round-trips preserve the original file convention.
+// Content returns the current buffer text verbatim from goeditor.
+// goeditor's GetCurrentContent joins lines with "\n" between but does NOT
+// append a trailing newline — that is the convention we surface to the rest
+// of nistru. Previously we memoised whether the initial SetContent ended
+// with '\n' and re-added it here, but that heuristic never updated as the
+// user edited: a user who intentionally deleted the EOF newline could not
+// persist that change because Content() would silently put it back, and
+// flushNow would write the old newline to disk.
+//
+// Dropping the heuristic means: files loaded with a trailing newline round-
+// trip through goeditor and come out without one (goeditor's own buffer
+// does not preserve it). Users who want a trailing newline can add one with
+// a keystroke; files without a trailing newline stay that way.
 func (a *goeditorAdapter) Content() string {
-	s := a.inner.GetCurrentContent()
-	if a.trailingNL && !strings.HasSuffix(s, "\n") {
-		s += "\n"
-	}
-	return s
+	return a.inner.GetCurrentContent()
 }
 
 // Mode maps goeditor's boolean accessors into our enum. We check Insert and
