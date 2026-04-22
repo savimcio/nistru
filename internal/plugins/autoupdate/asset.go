@@ -20,7 +20,7 @@ const checksumsAssetName = "checksums.txt"
 //
 // Supported name patterns (tried in order, case-insensitive):
 //
-//	nistru_<version>_<goos>_<goarch>.tar.gz
+//	nistru_<version>_<goos>_<goarch>.tar.gz    (version may be SemVer with prerelease, e.g. "0.2.0-rc.1")
 //	nistru_<goos>_<goarch>.tar.gz
 //	nistru-<goos>-<goarch>.tar.gz
 //	nistru_<version>_<goos>_<goarch>.zip
@@ -66,7 +66,11 @@ func AssetMatch(rel Release, goos, goarch string) (Asset, Asset, error) {
 //
 // The allowed extensions are ".tar.gz" (and its ".tgz" alias) for POSIX and
 // ".zip" for Windows. Separators between project/os/arch may be underscores
-// or hyphens; a middle version segment is tolerated but not required.
+// or hyphens; a middle version segment is tolerated but not required, and
+// may itself span multiple tokens because SemVer prerelease identifiers
+// contribute hyphens ("0.2.0-rc.1", "0.2.0-beta.2", etc.). We therefore
+// anchor on the trailing two tokens as (goos, goarch) rather than counting
+// the whole sequence.
 func assetNameMatches(name, goos, goarch string) bool {
 	ext := assetExt(name)
 	if ext == "" {
@@ -74,25 +78,22 @@ func assetNameMatches(name, goos, goarch string) bool {
 	}
 	stem := strings.TrimSuffix(name, ext)
 
-	// Project prefix: "nistru", followed by either "_" or "-".
 	const project = "nistru"
 	if !strings.HasPrefix(stem, project+"_") && !strings.HasPrefix(stem, project+"-") {
 		return false
 	}
 	rest := stem[len(project)+1:]
 
-	// Split on either separator; the resulting tokens must contain both
-	// goos and goarch as adjacent tokens, in order. We accept one leading
-	// version token (e.g. "v0.2.0" or "0.2.0") or none.
+	// The version segment is optional and may itself contain hyphens when
+	// a SemVer prerelease identifier is present ("0.2.0-rc.1", "0.2.0-beta.2",
+	// etc.), producing extra tokens between the project prefix and the
+	// trailing (goos, goarch) pair. Anchor on the last two tokens rather
+	// than counting the whole sequence.
 	tokens := splitOnSepChars(rest, "_-")
-	switch len(tokens) {
-	case 2:
-		return tokens[0] == goos && tokens[1] == goarch
-	case 3:
-		return tokens[1] == goos && tokens[2] == goarch
-	default:
+	if len(tokens) < 2 {
 		return false
 	}
+	return tokens[len(tokens)-2] == goos && tokens[len(tokens)-1] == goarch
 }
 
 // assetExt returns the archive extension (".tar.gz", ".tgz", ".zip") of
