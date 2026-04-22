@@ -113,6 +113,8 @@ _ = cmd // drain if the test needs the follow-up msg
 
 Canonical example: [`internal/editor/model_component_test.go`](../internal/editor/model_component_test.go). Use it as the template for any new flow.
 
+Editor-facing component tests swap the real goeditor adapter for `fakeEditor`, a small stand-in that implements the `Editor` interface defined in [`internal/editor/editoriface.go`](../internal/editor/editoriface.go). `fakeEditor` lives in [`internal/editor/editor_test.go`](../internal/editor/editor_test.go) and records the messages it receives, the mode transitions it's asked to make, and any undo/redo/status effects the model dispatches — everything a component test needs to assert without booting goeditor's TUI. When adding a flow that pokes the editor, extend `fakeEditor` first and assert against its recorded state rather than adding a new test seam.
+
 For component tests that need a live out-of-process plugin without the cost of a full e2e build, `plugin/host_test.go` has a `PLUGIN_MODE` self-spawn pattern: the test binary re-executes itself with an env var set, and an `init()` branch runs a minimal plugin main. Reuse it; do not reinvent the subprocess dance.
 
 ## Writing e2e tests

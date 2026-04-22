@@ -1,13 +1,11 @@
-▾ 001/                        │   1
-└── ▸ aaaaaaaa/               │package
-                              │deep
-                              │   1
-                              │
-                              │
-                              │
-                              │
-                              │
+▾ 001/                       │   1 packa
+└── ▸ aaaaaaaa/              │     ge
+                             │     deep
+                             │
+                             │
+                             │
+                             │
+                             │ NORMAL
+                             │1/1
 
-                                NORMAL
-                               1:1
 [NORMAL] …ccc/dddddddd/eeeeeeee/file.go

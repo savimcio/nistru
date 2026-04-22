@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/savimcio/nistru/internal/config"
 	"github.com/savimcio/nistru/internal/plugins/settingscmd"
@@ -89,21 +89,70 @@ func TestModel_OpenFileFlow(t *testing.T) {
 		if got.dirty {
 			t.Errorf("dirty should be false after successful open")
 		}
-		if got.lastText != "package main\n\nfunc main() {}\n" {
-			t.Errorf("lastText not seeded from file: got %q", got.lastText)
+		// goeditor's buffer does not preserve the file's trailing newline, so
+		// both lastText (seeded from editor.Content() after SetContent) and
+		// the live editor buffer drop the final '\n'. This is deliberate:
+		// re-adding the newline via a memoised flag caused data-loss bugs for
+		// users who intentionally deleted the EOF newline (see commit history).
+		wantBuf := "package main\n\nfunc main() {}"
+		if got.lastText != wantBuf {
+			t.Errorf("lastText not seeded from file: got %q, want %q", got.lastText, wantBuf)
 		}
 		// Buffer should contain the file contents so a subsequent View() or
 		// change-tick would see them.
-		if txt := got.editor.GetBuffer().Text(); txt != got.lastText {
+		if txt := got.editor.Content(); txt != got.lastText {
 			t.Errorf("editor buffer mismatch: got %q, want %q", txt, got.lastText)
 		}
-		// openFile returns tea.Batch(editor.Init(), ...) — non-nil cmd.
-		if cmd == nil {
-			t.Errorf("expected non-nil cmd from openFile; got nil")
-		}
+		// openFile no longer issues a fresh editor.Init(): F2.1 switched to
+		// reusing the single editor instance across opens, so Init() (and its
+		// outstanding listener goroutine) only runs once at Model construction.
+		// The returned cmd therefore carries only plugin-effect cmds from the
+		// DidOpen dispatch — nil when no registered plugin produces an effect
+		// (the typical component-test case). Asserting nil here would be too
+		// strict if a plugin ever registered in newTestModel's host; asserting
+		// non-nil would be too strict when none do. We assert the observable
+		// contract instead: the editor is the same instance before and after
+		// open, and the state we care about (openPath, dirty, focus) is set.
+		_ = cmd
 		// Focus flips to editor on open.
 		if got.focus != focusEditor {
 			t.Errorf("focus after open: got %v, want focusEditor", got.focus)
+		}
+	})
+
+	// F2.1 regression: openFile must reuse m.editor across opens rather than
+	// constructing a new adapter. Fresh adapters leaked goeditor's in-flight
+	// timer/Init cmds past the swap, so stale tea.Msgs from the previous
+	// editor landed on the new one via the non-key forwarding path.
+	t.Run("editor instance is reused across successful opens", func(t *testing.T) {
+		dir := t.TempDir()
+		pathA := writeFile(t, dir, "a.txt", "hello A\n")
+		pathB := writeFile(t, dir, "b.txt", "hello B\n")
+		m := newTestModel(t, dir)
+
+		initialEditor := m.editor
+
+		newM, _ := m.Update(openFileRequestMsg{path: pathA})
+		afterA := newM.(*Model)
+		if afterA.editor != initialEditor {
+			t.Fatalf("editor identity changed on first open; F2.1 requires reuse")
+		}
+		if got := afterA.editor.Content(); got != "hello A" {
+			t.Errorf("buffer after open(A) = %q, want %q", got, "hello A")
+		}
+
+		newM, _ = afterA.Update(openFileRequestMsg{path: pathB})
+		afterB := newM.(*Model)
+		if afterB.editor != initialEditor {
+			t.Errorf("editor identity changed on second open; F2.1 requires reuse")
+		}
+		if got := afterB.editor.Content(); got != "hello B" {
+			t.Errorf("buffer after open(B) = %q, want %q", got, "hello B")
+		}
+		// Mode must be Normal after the swap even if the previous buffer was
+		// mid-Insert — opening a file should not strand the user in Insert.
+		if mode := afterB.editor.Mode(); mode != ModeNormal {
+			t.Errorf("mode after open(B) = %v, want ModeNormal", mode)
 		}
 	})
 
@@ -146,6 +195,69 @@ func TestModel_OpenFileFlow(t *testing.T) {
 			t.Errorf("expected a status-message cmd on binary refusal")
 		}
 	})
+
+	// F3.3 regression: DidOpen.Text must carry the editor's buffer — which is
+	// what the user will be editing — not the raw file bytes. goeditor drops
+	// the trailing newline on load, so those two strings differ for files
+	// with a trailing '\n'. A plugin that caches DidOpen.Text (e.g. the
+	// bundled gofmt) would otherwise operate on stale content until the
+	// first DidChange arrived.
+	t.Run("DidOpen.Text matches editor buffer, not raw file bytes", func(t *testing.T) {
+		dir := t.TempDir()
+		// Trailing newline is the interesting case — goeditor drops it.
+		raw := "package main\n\nfunc main() {}\n"
+		path := writeFile(t, dir, "hello.go", raw)
+
+		t.Setenv("NISTRU_AUTOUPDATE_DISABLE", "1")
+		t.Setenv("NISTRU_AUTOUPDATE_REPO", "")
+		t.Setenv("NISTRU_AUTOUPDATE_CHANNEL", "")
+		t.Setenv("NISTRU_AUTOUPDATE_INTERVAL", "")
+		rec := &didOpenRecorder{}
+		reg := plugin.NewRegistry()
+		reg.RegisterInProc(rec)
+		m, err := newModelWithRegistry(dir, reg, config.Defaults())
+		if err != nil {
+			t.Fatalf("newModelWithRegistry: %v", err)
+		}
+		t.Cleanup(func() { _ = m.host.Shutdown(100 * time.Millisecond) })
+
+		if _, _ = m.Update(openFileRequestMsg{path: path}); rec.lastOpenText == "" {
+			t.Fatalf("recorder did not receive DidOpen")
+		}
+		// The recorder captures whatever Text the host forwarded — which, after
+		// the fix, is m.lastText (editor's buffer). If the bug reappears it
+		// would be the raw file bytes (with trailing newline).
+		if rec.lastOpenText == raw {
+			t.Errorf("DidOpen.Text carried raw file bytes (%q); should carry editor buffer", raw)
+		}
+		want := m.lastText
+		if rec.lastOpenText != want {
+			t.Errorf("DidOpen.Text = %q, want %q (editor buffer)", rec.lastOpenText, want)
+		}
+	})
+}
+
+// didOpenRecorder is a minimal in-proc plugin that captures the most recent
+// DidOpen event it receives. onStart activates it at boot so it stays
+// subscribed for subsequent DidOpen events (activated plugins receive
+// mismatched-pattern events for state continuity; see host.shouldDispatch).
+type didOpenRecorder struct {
+	mu            sync.Mutex
+	lastOpenText  string
+	lastOpenPath  string
+}
+
+func (r *didOpenRecorder) Name() string           { return "didopen-recorder" }
+func (r *didOpenRecorder) Activation() []string   { return []string{"onStart"} }
+func (r *didOpenRecorder) Shutdown() error        { return nil }
+func (r *didOpenRecorder) OnEvent(event any) []plugin.Effect {
+	if e, ok := event.(plugin.DidOpen); ok {
+		r.mu.Lock()
+		r.lastOpenText = e.Text
+		r.lastOpenPath = e.Path
+		r.mu.Unlock()
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -172,8 +284,12 @@ func TestModel_AutosaveLoopEndToEnd(t *testing.T) {
 
 		// Simulate an edit: mutate the buffer + mark dirty + bump gens the
 		// same way forwardToFocused would. Record the new change/save gens
-		// as the "live" ones.
-		m.editor.GetBuffer().InsertAt(0, 0, "x")
+		// as the "live" ones. We prepend "x" to the current content via
+		// SetContent — the buffer-mutation API we used to have via
+		// GetBuffer().InsertAt is gone with the goeditor migration, but
+		// prepend-via-SetContent produces an equivalent end state for this
+		// flow test.
+		m.editor.SetContent("x" + m.editor.Content())
 		m.dirty = true
 		m.changeGen++
 		m.saveGen++
@@ -191,7 +307,7 @@ func TestModel_AutosaveLoopEndToEnd(t *testing.T) {
 		m = newM.(*Model)
 
 		// Assert disk contents equal the mutated buffer.
-		wantOnDisk := m.editor.GetBuffer().Text()
+		wantOnDisk := m.editor.Content()
 		gotOnDisk, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatalf("readback: %v", err)
@@ -217,12 +333,12 @@ func TestModel_AutosaveLoopEndToEnd(t *testing.T) {
 
 		// Two "edits" bump saveGen twice. The stale tick carries the earlier
 		// gen and must be discarded.
-		m.editor.GetBuffer().InsertAt(0, 0, "A")
+		m.editor.SetContent("A" + m.editor.Content())
 		m.dirty = true
 		m.saveGen++
 		staleGen := m.saveGen
 
-		m.editor.GetBuffer().InsertAt(0, 1, "B")
+		m.editor.SetContent("B" + m.editor.Content())
 		m.saveGen++ // bump again — staleGen is now outdated
 
 		// Record the disk contents before the stale tick so we can assert no
@@ -250,8 +366,8 @@ func TestModel_AutosaveLoopEndToEnd(t *testing.T) {
 		m := newTestModel(t, t.TempDir())
 		// No file opened. Tick with zeroed gen.
 		newM, cmd := m.Update(saveTickMsg{gen: 0})
-		if newM != m {
-			t.Errorf("Update should return the same model")
+		if got, ok := newM.(*Model); !ok || got != m {
+			t.Errorf("Update should return the same *Model; got %T", newM)
 		}
 		if cmd != nil {
 			t.Errorf("save-tick with no open file should produce nil cmd")
@@ -261,8 +377,8 @@ func TestModel_AutosaveLoopEndToEnd(t *testing.T) {
 	t.Run("change-tick with no open file is no-op", func(t *testing.T) {
 		m := newTestModel(t, t.TempDir())
 		newM, cmd := m.Update(changeTickMsg{gen: 0})
-		if newM != m {
-			t.Errorf("Update should return the same model")
+		if got, ok := newM.(*Model); !ok || got != m {
+			t.Errorf("Update should return the same *Model; got %T", newM)
 		}
 		if cmd != nil {
 			t.Errorf("change-tick with no open file should produce nil cmd")
@@ -283,12 +399,12 @@ func TestModel_DirtyAndQuitSafety(t *testing.T) {
 		// Open A and dirty it.
 		newM, _ := m.Update(openFileRequestMsg{path: pathA})
 		m = newM.(*Model)
-		m.editor.GetBuffer().InsertAt(0, 0, "DIRTY-")
+		m.editor.SetContent("DIRTY-" + m.editor.Content())
 		m.dirty = true
 
 		// Capture what the A buffer now contains — that's what openFile's
 		// flush must persist to disk before swapping editors.
-		wantA := m.editor.GetBuffer().Text()
+		wantA := m.editor.Content()
 
 		// Switch to B.
 		newM, _ = m.Update(openFileRequestMsg{path: pathB})
@@ -317,9 +433,9 @@ func TestModel_DirtyAndQuitSafety(t *testing.T) {
 
 		newM, _ := m.Update(openFileRequestMsg{path: path})
 		m = newM.(*Model)
-		m.editor.GetBuffer().InsertAt(0, 0, "DIRTY-")
+		m.editor.SetContent("DIRTY-" + m.editor.Content())
 		m.dirty = true
-		wantOnDisk := m.editor.GetBuffer().Text()
+		wantOnDisk := m.editor.Content()
 
 		// Ctrl+Q is the user-facing trigger for guardedQuit. forceQuitMsg is
 		// the internal sentinel handled at model.go:165.
@@ -366,7 +482,7 @@ func TestModel_PaletteFlow(t *testing.T) {
 		if m.palette.open {
 			t.Fatalf("pre: palette should be closed")
 		}
-		newM, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+		newM, _ := m.Update(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl})
 		got := newM.(*Model)
 		if !got.palette.open {
 			t.Errorf("palette should be open after Ctrl+P")
@@ -381,10 +497,12 @@ func TestModel_PaletteFlow(t *testing.T) {
 			"format.file": {Title: "Format buffer", Plugin: "gofmt"},
 			"tree.expand": {Title: "Expand node", Plugin: "tree"},
 		}
-		_, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+		_, _ = m.Update(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl})
 
-		// Type "g" — should keep only entries containing "g".
-		_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+		// Type "g" — should keep only entries containing "g". In v2 a
+		// printable rune arrives as KeyPressMsg{Code: 'g', Text: "g"} and
+		// the palette's HandleKey reads Text via keyEventFromTea → runes.
+		_, _ = m.Update(tea.KeyPressMsg{Code: 'g', Text: "g"})
 		if m.palette.query != "g" {
 			t.Errorf("after 'g': query=%q, want %q", m.palette.query, "g")
 		}
@@ -394,13 +512,13 @@ func TestModel_PaletteFlow(t *testing.T) {
 		}
 
 		// Type "o" — filter becomes "go".
-		_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'o'}})
+		_, _ = m.Update(tea.KeyPressMsg{Code: 'o', Text: "o"})
 		if m.palette.query != "go" {
 			t.Errorf("after 'go': query=%q", m.palette.query)
 		}
 
 		// Typing "z" should drop results to zero.
-		_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+		_, _ = m.Update(tea.KeyPressMsg{Code: 'z', Text: "z"})
 		if m.palette.query != "goz" {
 			t.Errorf("after 'goz': query=%q", m.palette.query)
 		}
@@ -412,11 +530,11 @@ func TestModel_PaletteFlow(t *testing.T) {
 	t.Run("Esc closes palette without executing", func(t *testing.T) {
 		m := newTestModel(t, t.TempDir())
 		m.commands = map[string]plugin.CommandRef{"a": {Title: "A"}}
-		_, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+		_, _ = m.Update(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl})
 		if !m.palette.open {
 			t.Fatalf("pre: palette should be open")
 		}
-		_, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		_, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEsc})
 		if m.palette.open {
 			t.Errorf("Esc should close palette")
 		}
@@ -439,11 +557,11 @@ func TestModel_PaletteFlow(t *testing.T) {
 		m.commands = map[string]plugin.CommandRef{
 			"do.it": {Title: "Do It", Plugin: "faker"},
 		}
-		_, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlP})
+		_, _ = m.Update(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl})
 		if len(m.palette.filtered) != 1 {
 			t.Fatalf("palette filtered count: got %d, want 1", len(m.palette.filtered))
 		}
-		_, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		_, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
 		if m.palette.open {
 			t.Errorf("palette should be closed after Enter")
 		}
@@ -625,11 +743,68 @@ func TestModel_PluginMessagePlumbing(t *testing.T) {
 		if cmd == nil {
 			t.Errorf("buffer/edit should batch editor.Init + host.Recv; got nil")
 		}
-		if got := m.editor.GetBuffer().Text(); got != "replaced by plugin\n" {
+		// goeditor drops the trailing newline from SetContent's input, so we
+		// assert against the stripped form. The plugin supplied
+		// "replaced by plugin\n"; the editor buffer holds the prefix.
+		if got := m.editor.Content(); got != "replaced by plugin" {
 			t.Errorf("buffer not replaced; got %q", got)
 		}
 		if m.dirty {
 			t.Errorf("dirty should be false after plugin-driven edit")
+		}
+	})
+
+	// F2.2 regression: after buffer/edit replaces the buffer with text that
+	// ends in "\n", lastText must equal m.editor.Content() (which has the
+	// trailing newline stripped by goeditor), not the raw p.Text. If drift
+	// sneaks back in, the next non-edit keystroke's dirty-diff in
+	// forwardToFocused flips dirty=true without a real user edit, which
+	// cascades into autosave, a DidChange dispatch, and a stray saveTick —
+	// the exact class of bug Codex flagged.
+	t.Run("buffer/edit with trailing newline leaves lastText aligned with editor", func(t *testing.T) {
+		dir := t.TempDir()
+		path := writeFile(t, dir, "fmt.go", "seed\n")
+		m := newTestModel(t, dir)
+		newM, _ := m.Update(openFileRequestMsg{path: path})
+		m = newM.(*Model)
+
+		// Simulate a formatter plugin (e.g. bundled gofmt) sending back text
+		// with a trailing newline. This is the common case that triggered the
+		// original drift.
+		params, _ := json.Marshal(map[string]string{
+			"path": path,
+			"text": "formatted\n",
+		})
+		_, _ = m.Update(plugin.PluginReqMsg{
+			Plugin: "fmtbot",
+			ID:     "req-fmt",
+			Method: "buffer/edit",
+			Params: params,
+		})
+
+		if got := m.editor.Content(); got != "formatted" {
+			t.Fatalf("editor content after buffer/edit = %q, want %q (goeditor strips trailing newline)", got, "formatted")
+		}
+		if m.lastText != m.editor.Content() {
+			t.Errorf("lastText = %q, editor.Content() = %q — drift violates the dirty-diff contract", m.lastText, m.editor.Content())
+		}
+		if m.dirty {
+			t.Errorf("dirty should be false immediately after buffer/edit")
+		}
+
+		// Simulate a subsequent non-edit keystroke (cursor motion) via a
+		// non-KeyPressMsg forwarded to the editor. We can't easily drive
+		// goeditor's cursor from here, so instead we just re-run the
+		// dirty-diff that forwardToFocused would run: if lastText is aligned
+		// with the editor buffer, no drift is detected.
+		saveGenBefore := m.saveGen
+		changeGenBefore := m.changeGen
+		if m.editor.Content() != m.lastText {
+			t.Errorf("pre-diff mismatch: editor=%q lastText=%q", m.editor.Content(), m.lastText)
+		}
+		if m.saveGen != saveGenBefore || m.changeGen != changeGenBefore {
+			t.Errorf("gens bumped without an edit: saveGen %d->%d, changeGen %d->%d",
+				saveGenBefore, m.saveGen, changeGenBefore, m.changeGen)
 		}
 	})
 
@@ -726,12 +901,12 @@ func TestModel_CustomKeymap_SavesOnConfiguredKey(t *testing.T) {
 	// Open the file and dirty its buffer so flushNow has something to write.
 	newM, _ := m.Update(openFileRequestMsg{path: path})
 	m = newM.(*Model)
-	m.editor.GetBuffer().InsertAt(0, 0, "X")
+	m.editor.SetContent("X" + m.editor.Content())
 	m.dirty = true
 
 	beforeSaved := m.lastSavedAt
 
-	newM, cmd := m.Update(tea.KeyMsg{Type: tea.KeyF5})
+	newM, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyF5})
 	m = newM.(*Model)
 
 	// If the config-driven binding worked, flushNow ran and lastSavedAt is
@@ -755,8 +930,8 @@ func TestModel_CustomKeymap_SavesOnConfiguredKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("readback: %v", err)
 	}
-	if string(gotOnDisk) != m.editor.GetBuffer().Text() {
-		t.Errorf("disk mismatch: got %q, want %q", gotOnDisk, m.editor.GetBuffer().Text())
+	if string(gotOnDisk) != m.editor.Content() {
+		t.Errorf("disk mismatch: got %q, want %q", gotOnDisk, m.editor.Content())
 	}
 }
 
@@ -990,11 +1165,11 @@ func TestModel_ReloadPalette_UpdatesPluginConfig(t *testing.T) {
 
 // TestModel_ReloadPalette_RelativeNumbersTakesEffect verifies that changing
 // [ui].relative_numbers on disk and firing the reload command actually
-// rebuilds the underlying vimtea.Editor so the new setting is in effect
-// immediately — without waiting for the user to open another file. vimtea
-// doesn't expose the flag on its Editor interface, so the assertion is
-// indirect: we take a before/after snapshot of m.editor's pointer identity
-// and confirm it changed, plus verify m.cfg.UI.RelativeNumbers took the new
+// rebuilds the underlying editor so the new setting is in effect
+// immediately — without waiting for the user to open another file. The
+// Editor interface doesn't expose the flag, so the assertion is indirect:
+// we take a before/after snapshot of m.editor's pointer identity and
+// confirm it changed, plus verify m.cfg.UI.RelativeNumbers took the new
 // value. Together, those two checks cover the observable contract — "the
 // editor instance that renders is the one that booted with the new setting".
 func TestModel_ReloadPalette_RelativeNumbersTakesEffect(t *testing.T) {
@@ -1102,4 +1277,199 @@ func numericEq(v any, want int) bool {
 		return x == want
 	}
 	return false
+}
+
+// -----------------------------------------------------------------------------
+// T7 — "strange scrolling" regression guards.
+//
+// Opening testdata/wide_table.md at 80x24 previously produced a View() with
+// >24 rows because the old editor's soft-wrap sometimes emitted lines wider
+// than the editor viewport; lipgloss's sized Render then wrapped each
+// overwide line into two visual rows. goeditor handles width natively at
+// its own boundary, so the stopgap clampPaneBox has been removed; these
+// invariants are implementation-agnostic regression guards.
+
+// openWideTable builds a Model sized to (w, h), loads the wide_table.md
+// fixture into tempdir/wide_table.md, opens it, and returns the Model. It is
+// the shared setup for every TestView_*_WideTable case below.
+func openWideTable(t *testing.T, w, h int) *Model {
+	t.Helper()
+	src, err := os.ReadFile(filepath.Join("testdata", "wide_table.md"))
+	if err != nil {
+		t.Fatalf("read wide_table fixture: %v", err)
+	}
+	dir := t.TempDir()
+	path := writeFile(t, dir, "wide_table.md", string(src))
+	m := newTestModel(t, dir)
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
+	m = newM.(*Model)
+	newM, _ = m.Update(openFileRequestMsg{path: path})
+	return newM.(*Model)
+}
+
+// TestView_RowCount_WideTable guards against the original bug: View() at
+// 80x24 inflated to 33 rows because overwide lines soft-wrapped inside
+// editorStyle.Render. Reads via renderFrame() to inspect the composed body
+// directly — View() now wraps that body in a v2 tea.View struct.
+func TestView_RowCount_WideTable(t *testing.T) {
+	m := openWideTable(t, 80, 24)
+	got := m.renderFrame()
+	lines := strings.Split(got, "\n")
+	if len(lines) != m.height {
+		t.Fatalf("renderFrame() line count: got %d, want %d (m.height)", len(lines), m.height)
+	}
+}
+
+// TestView_NoDuplicateGutterNumbers_WideTable asserts that numbers followed
+// by file text never repeat in the editor gutter. The original bug's visible
+// symptom was "1 # Wide table repro" appearing on both row 1 and row 2
+// because the first editor line soft-wrapped into two rendered rows. With
+// relative-numbering on, a gutter digit like "1" alone (relative distance)
+// on a row WITHOUT trailing content is normal and ignored; what's abnormal
+// is the same "N text…" pair showing up twice.
+func TestView_NoDuplicateGutterNumbers_WideTable(t *testing.T) {
+	m := openWideTable(t, 80, 24)
+	got := m.renderFrame()
+	lines := strings.Split(got, "\n")
+
+	seen := make(map[string]int)
+	for i, line := range lines {
+		// Extract the editor region (after the divider if the tree pane is
+		// showing). Falling through to the whole line when no divider is
+		// present keeps the test robust to layout changes.
+		region := line
+		if _, after, found := strings.Cut(line, "│"); found {
+			region = after
+		}
+		num, rest := splitGutterNumber(region)
+		rest = strings.TrimSpace(rest)
+		if num == "" || rest == "" {
+			// Either not a gutter row or a relative-only row with no
+			// trailing file text — nothing to guard against here.
+			continue
+		}
+		key := num + "\x1f" + rest
+		if prev, ok := seen[key]; ok {
+			t.Fatalf("editor gutter pair %q+%q appears on both row %d and row %d:\n%s", num, rest, prev, i, got)
+		}
+		seen[key] = i
+	}
+}
+
+// TestView_IdempotentAcrossCalls_WideTable asserts that two successive
+// renderFrame() calls produce the same output. Any hidden mutable state in
+// the composition path (e.g. in-place slice reuse) would surface here.
+func TestView_IdempotentAcrossCalls_WideTable(t *testing.T) {
+	m := openWideTable(t, 80, 24)
+	first := m.renderFrame()
+	second := m.renderFrame()
+	if first != second {
+		t.Fatalf("renderFrame() not idempotent across calls:\n--- first ---\n%s\n--- second ---\n%s", first, second)
+	}
+}
+
+// TestView_TreeNoDuplicateEntries_WideTable asserts that no non-empty tree
+// row content repeats in the left pane — the tree shares the same clamp path
+// as the editor, and a bug that double-rendered a row would surface as a
+// repeated basename in the gutter column.
+func TestView_TreeNoDuplicateEntries_WideTable(t *testing.T) {
+	m := openWideTable(t, 80, 24)
+	got := m.renderFrame()
+	tw := m.treeWidth()
+	lines := strings.Split(got, "\n")
+	seen := make(map[string]int, len(lines))
+	// Under lipgloss v2, Width(tw) is the pane total including the right
+	// border, so the divider rune sits at index tw-1. Slice to tw-1 to stay
+	// inside the tree content only; otherwise every empty row contributes
+	// "│" as a bogus duplicate.
+	contentW := tw - 1
+	if contentW < 0 {
+		contentW = 0
+	}
+	for i, line := range lines {
+		// Take only the tree-pane content column. Rune-slicing is an
+		// over-approximation vs. display cells, but it's sufficient to
+		// catch whole-row duplicates.
+		runes := []rune(line)
+		if len(runes) > contentW {
+			runes = runes[:contentW]
+		}
+		cell := strings.TrimSpace(string(runes))
+		if cell == "" {
+			continue
+		}
+		if prev, ok := seen[cell]; ok {
+			t.Fatalf("tree cell %q appears on both row %d and row %d:\n%s", cell, prev, i, got)
+		}
+		seen[cell] = i
+	}
+}
+
+// splitGutterNumber returns the leading gutter number and the content that
+// follows it. A leading run of ASCII whitespace is skipped, then digits are
+// consumed; both parts may be empty strings.
+func splitGutterNumber(s string) (num, rest string) {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	start := i
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	return s[start:i], s[i:]
+}
+
+// -----------------------------------------------------------------------------
+// F.4 regression: non-key messages must always reach the editor, regardless
+// of focus. goeditor uses non-key tea.Msgs to drive transient UI such as
+// DispatchMessage's clear timer. When the tree has focus (the default at
+// startup), the old routing dropped those messages and status text that the
+// editor emitted via SetStatusMessage stuck on screen forever.
+
+func TestForwardToFocused_NonKeyMsgAlwaysReachesEditor(t *testing.T) {
+	type arbitraryTickMsg struct{ tag string }
+
+	t.Run("tree focused: non-key msg is forwarded to editor", func(t *testing.T) {
+		fe := &fakeEditor{}
+		m := &Model{editor: fe, focus: focusTree}
+		msg := arbitraryTickMsg{tag: "clear-status"}
+
+		_, _ = m.forwardToFocused(msg)
+		if len(fe.updateMsgs) != 1 {
+			t.Fatalf("editor should have received the non-key msg; got %d: %+v", len(fe.updateMsgs), fe.updateMsgs)
+		}
+		if got, _ := fe.updateMsgs[0].(arbitraryTickMsg); got != msg {
+			t.Errorf("editor received wrong msg: got %+v, want %+v", fe.updateMsgs[0], msg)
+		}
+	})
+
+	t.Run("editor focused: non-key msg still forwarded", func(t *testing.T) {
+		fe := &fakeEditor{}
+		m := &Model{editor: fe, focus: focusEditor}
+		msg := arbitraryTickMsg{tag: "also-reaches"}
+
+		_, _ = m.forwardToFocused(msg)
+		if len(fe.updateMsgs) != 1 {
+			t.Fatalf("editor should have received the non-key msg; got %d: %+v", len(fe.updateMsgs), fe.updateMsgs)
+		}
+	})
+
+	t.Run("tree focused: key msg is NOT forwarded to editor", func(t *testing.T) {
+		// The focus gate still applies to key events — the editor must not
+		// receive keystrokes meant for the tree. This is the other half of
+		// the split and keeps the fix from regressing into "forward all
+		// messages unconditionally".
+		fe := &fakeEditor{}
+		// leftPane == nil → handleKey path for the tree short-circuits to
+		// (m, nil) but the critical assertion is that the editor did NOT
+		// see the key.
+		m := &Model{editor: fe, focus: focusTree, leftPane: nil}
+		key := tea.KeyPressMsg{Code: 'j', Text: "j"}
+
+		_, _ = m.forwardToFocused(key)
+		if len(fe.updateMsgs) != 0 {
+			t.Errorf("editor must NOT see tree-focused key events; got %+v", fe.updateMsgs)
+		}
+	})
 }

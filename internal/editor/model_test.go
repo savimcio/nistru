@@ -5,9 +5,8 @@ import (
 	"testing"
 	"unicode/utf8"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/kujtimiihoxha/vimtea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/savimcio/nistru/internal/config"
 	"github.com/savimcio/nistru/plugin"
@@ -26,15 +25,15 @@ func TestLangFromPath_Table(t *testing.T) {
 		{"main.go", "go"},
 		{"README.md", "md"},
 		{"notes.rs", "rs"},
-		{"Makefile", ""},  // no extension
+		{"Makefile", ""}, // no extension
 		{"Dockerfile", ""},
 		{"no-ext", ""},
 		{"/abs/path/to/file.py", "py"},
 		{"nested/dir/script.sh", "sh"},
-		{"HEADER.GO", "go"},    // uppercase normalised to lowercase
-		{".hidden", "hidden"},  // dotfiles: filepath.Ext returns ".hidden"; TrimPrefix gives "hidden"
-		{"archive.tar.gz", "gz"}, // only the last extension
-		{"", ""},               // empty path
+		{"HEADER.GO", "go"},       // uppercase normalised to lowercase
+		{".hidden", "hidden"},     // dotfiles: filepath.Ext returns ".hidden"; TrimPrefix gives "hidden"
+		{"archive.tar.gz", "gz"},  // only the last extension
+		{"", ""},                  // empty path
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
@@ -166,17 +165,15 @@ func TestFilterSegments_AllDroppedReturnsEmpty(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// renderStatusBar — width invariants. renderStatusBar needs a real vimtea
-// Editor (for GetMode), so we build a Model that uses newEditor("", "") and
-// exercise the status-bar rendering at several widths.
+// renderStatusBar — width invariants. renderStatusBar reads mode via
+// m.editor.Mode(); a fakeEditor stub is enough because we never dispatch a
+// message through it — the status-bar render path is all Model state plus a
+// single Mode() call.
 
 func TestRenderStatusBar_WidthInvariants(t *testing.T) {
-	// newEditor creates a real vimtea.Editor, which is fine here — we don't
-	// dispatch any messages through it; we only call GetMode() from within
-	// renderStatusBar.
 	newModel := func(width int, segs []statusSegment, openPath, root string) *Model {
 		return &Model{
-			editor:         newEditor("", ""),
+			editor:         &fakeEditor{},
 			width:          width,
 			height:         24,
 			openPath:       openPath,
@@ -245,7 +242,7 @@ func TestRenderStatusBar_LongPathShowsLeadingEllipsis(t *testing.T) {
 	// Force the path through the leading-ellipsis branch: width is small,
 	// path is long and absolute.
 	m := &Model{
-		editor:   newEditor("", ""),
+		editor:   &fakeEditor{},
 		width:    40,
 		height:   24,
 		openPath: "/absolute/" + strings.Repeat("very-long-segment/", 10) + "file.go",
@@ -292,22 +289,22 @@ func TestEditorWidth_WithAndWithoutLeftPane(t *testing.T) {
 // editorWidth to observe a non-nil leftPane.
 type stubPane struct{}
 
-func (stubPane) Render(int, int) string                   { return "" }
-func (stubPane) OnResize(int, int)                        {}
-func (stubPane) OnFocus(bool)                             {}
-func (stubPane) Slot() string                             { return "left" }
+func (stubPane) Render(int, int) string                    { return "" }
+func (stubPane) OnResize(int, int)                         {}
+func (stubPane) OnFocus(bool)                              {}
+func (stubPane) Slot() string                              { return "left" }
 func (stubPane) HandleKey(plugin.KeyEvent) []plugin.Effect { return nil }
 
 func TestModeName_AllKnownModes(t *testing.T) {
 	cases := []struct {
-		in   vimtea.EditorMode
+		in   Mode
 		want string
 	}{
-		{vimtea.ModeNormal, "NORMAL"},
-		{vimtea.ModeInsert, "INSERT"},
-		{vimtea.ModeVisual, "VISUAL"},
-		{vimtea.ModeCommand, "COMMAND"},
-		{vimtea.EditorMode(42), "?"}, // unknown
+		{ModeNormal, "NORMAL"},
+		{ModeInsert, "INSERT"},
+		{ModeVisual, "VISUAL"},
+		{ModeCommand, "COMMAND"},
+		{Mode(42), "?"}, // unknown
 	}
 	for _, tc := range cases {
 		if got := modeName(tc.in); got != tc.want {
@@ -317,11 +314,10 @@ func TestModeName_AllKnownModes(t *testing.T) {
 }
 
 func TestKeyEventFromTea_CopiesFields(t *testing.T) {
-	km := tea.KeyMsg{
-		Type:  tea.KeyRunes,
-		Runes: []rune{'h', 'i'},
-		Alt:   true,
-	}
+	// In v2, printable keystrokes arrive with Text set and Mod carrying any
+	// modifiers (Alt included). We build an Alt+"hi" chord to exercise both
+	// the Text → Runes copy and the Alt detection branch.
+	km := tea.KeyPressMsg{Text: "hi", Mod: tea.ModAlt}
 	got := keyEventFromTea(km)
 	if got.Key != km.String() {
 		t.Errorf("Key: got %q, want %q", got.Key, km.String())
@@ -403,7 +399,7 @@ func TestApplyEffects_OpenFileProducesOpenFileRequestMsg(t *testing.T) {
 func TestApplyEffects_NotifyEmptyMessageIsNoOp(t *testing.T) {
 	// Notify with empty Message should not produce a cmd. This exercises
 	// the early-skip branch without needing a real editor.
-	m := &Model{editor: newEditor("", "")}
+	m := &Model{editor: &fakeEditor{}}
 	cmd := m.applyEffects([]plugin.Effect{plugin.Notify{Message: ""}})
 	if cmd != nil {
 		t.Errorf("empty Notify should be no-op; got cmd %T", cmd)
@@ -426,11 +422,12 @@ func TestApplyEffects_InvalidateAndOpenFile_BatchedWhenMixed(t *testing.T) {
 
 // Update dispatch: a small slice of the state machine that needs neither
 // plugin host nor tea.Program. The WindowSizeMsg path is pure state mutation
-// on m.width / m.height (plus editor.SetSize, which is fine on a real
-// vimtea.Editor with no bindings dispatched).
+// on m.width / m.height (plus editor.SetSize, which is recorded by the
+// fakeEditor).
 
 func TestUpdate_WindowSizeMsgSetsDimsAndForwardsToEditor(t *testing.T) {
-	m := &Model{editor: newEditor("", "")}
+	fe := &fakeEditor{}
+	m := &Model{editor: fe}
 	newM, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
 	got, ok := newM.(*Model)
 	if !ok {
@@ -439,26 +436,43 @@ func TestUpdate_WindowSizeMsgSetsDimsAndForwardsToEditor(t *testing.T) {
 	if got.width != 120 || got.height != 40 {
 		t.Errorf("dims not stored: width=%d height=%d", got.width, got.height)
 	}
+	if !fe.setSize.called {
+		t.Errorf("expected WindowSizeMsg to trigger editor.SetSize")
+	}
 }
 
 // Default-case Update dispatch (unknown tea.Msg) must call forwardToFocused
-// without panicking. With no leftPane and focusTree, non-KeyMsg traffic is
-// dropped silently — exercise that early return.
+// without panicking. Non-key messages are forwarded to the editor regardless
+// of focus (so the editor's internal timers — e.g. DispatchMessage's clear
+// tick — keep working when the tree has focus). See F.4 regression in
+// TestForwardToFocused_NonKeyMsgAlwaysReachesEditor below.
 
 type unknownMsg struct{}
 
-func TestUpdate_UnknownMsgWithNoLeftPaneIsNoOp(t *testing.T) {
+func TestUpdate_UnknownMsgForwardsToEditorEvenWhenTreeFocused(t *testing.T) {
+	fe := &fakeEditor{}
 	m := &Model{
-		editor:   newEditor("", ""),
+		editor:   fe,
 		focus:    focusTree,
 		leftPane: nil,
 	}
-	newM, cmd := m.Update(unknownMsg{})
-	if newM != m {
-		t.Errorf("Update should return the same model pointer")
+	msg := unknownMsg{}
+	newM, cmd := m.Update(msg)
+	got, ok := newM.(*Model)
+	if !ok || got != m {
+		t.Errorf("Update should return the same *Model pointer; got %T (%v)", newM, newM)
 	}
 	if cmd != nil {
-		t.Errorf("unknown msg with focusTree+no leftPane should produce nil cmd")
+		t.Errorf("fakeEditor.Update returns nil; wrapper should not synthesise a cmd, got %v", cmd)
+	}
+	// F.4: the unknown message must have reached the editor even though
+	// the tree has focus. Without this the editor's DispatchMessage timers
+	// stall and status messages stick.
+	if len(fe.updateMsgs) != 1 {
+		t.Fatalf("editor should have received 1 msg when tree focused; got %d: %+v", len(fe.updateMsgs), fe.updateMsgs)
+	}
+	if fe.updateMsgs[0] != msg {
+		t.Errorf("editor received unexpected msg: got %+v, want %+v", fe.updateMsgs[0], msg)
 	}
 }
 
@@ -471,10 +485,10 @@ func TestUpdate_UnknownMsgWithNoLeftPaneIsNoOp(t *testing.T) {
 
 func TestHandleKey_CtrlPOpensPalette(t *testing.T) {
 	m := &Model{
-		editor:   newEditor("", ""),
+		editor:   &fakeEditor{},
 		commands: map[string]plugin.CommandRef{"a": {Title: "A"}},
 	}
-	newM, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlP})
+	newM, cmd := m.handleKey(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl})
 	if cmd != nil {
 		t.Errorf("Ctrl+P should produce no cmd; got %T", cmd)
 	}
@@ -489,15 +503,15 @@ func TestHandleKey_CtrlPOpensPalette(t *testing.T) {
 
 func TestHandleKey_TabTogglesFocus(t *testing.T) {
 	m := &Model{
-		editor: newEditor("", ""),
+		editor: &fakeEditor{},
 		focus:  focusTree,
 	}
-	newM, _ := m.handleKey(tea.KeyMsg{Type: tea.KeyTab})
+	newM, _ := m.handleKey(tea.KeyPressMsg{Code: tea.KeyTab})
 	got := newM.(*Model)
 	if got.focus != focusEditor {
 		t.Errorf("Tab from tree should move focus to editor; got %v", got.focus)
 	}
-	newM, _ = got.handleKey(tea.KeyMsg{Type: tea.KeyShiftTab})
+	newM, _ = got.handleKey(tea.KeyPressMsg{Code: tea.KeyTab, Mod: tea.ModShift})
 	got = newM.(*Model)
 	if got.focus != focusTree {
 		t.Errorf("Shift+Tab from editor should move focus back to tree; got %v", got.focus)
@@ -507,8 +521,8 @@ func TestHandleKey_TabTogglesFocus(t *testing.T) {
 func TestHandleKey_CtrlSWithNoOpenFileIsNoOp(t *testing.T) {
 	// flushNow early-returns when openPath=="" — no file write, just a
 	// status message cmd.
-	m := &Model{editor: newEditor("", ""), openPath: ""}
-	_, cmd := m.handleKey(tea.KeyMsg{Type: tea.KeyCtrlS})
+	m := &Model{editor: &fakeEditor{}, openPath: ""}
+	_, cmd := m.handleKey(tea.KeyPressMsg{Code: 's', Mod: tea.ModCtrl})
 	if cmd == nil {
 		t.Errorf("Ctrl+S should produce a status-message cmd even with no open file")
 	}
@@ -519,14 +533,14 @@ func TestHandleKey_CtrlSWithNoOpenFileIsNoOp(t *testing.T) {
 
 func TestHandlePaletteKey_EscClosesPalette(t *testing.T) {
 	m := &Model{
-		editor:   newEditor("", ""),
+		editor:   &fakeEditor{},
 		commands: map[string]plugin.CommandRef{"a": {Title: "A"}},
 	}
 	m.palette.Open(m.commands)
 	if !m.palette.open {
 		t.Fatalf("precondition: palette should be open")
 	}
-	newM, cmd := m.handlePaletteKey(tea.KeyMsg{Type: tea.KeyEsc})
+	newM, cmd := m.handlePaletteKey(tea.KeyPressMsg{Code: tea.KeyEsc})
 	if cmd != nil {
 		t.Errorf("esc in palette should produce no cmd; got %T", cmd)
 	}
@@ -536,13 +550,15 @@ func TestHandlePaletteKey_EscClosesPalette(t *testing.T) {
 	}
 }
 
-// View early-return path: before any WindowSizeMsg, width/height are zero
-// and View must produce an empty string so the initial frame is blank.
+// renderFrame early-return path: before any WindowSizeMsg, width/height are
+// zero and renderFrame must produce an empty string so the initial frame is
+// blank. We call renderFrame() directly to inspect the body independently of
+// the tea.View wrapper View() returns in v2.
 
-func TestView_EarlyReturnWhenUnsized(t *testing.T) {
-	m := &Model{editor: newEditor("", ""), width: 0, height: 0}
-	if got := m.View(); got != "" {
-		t.Errorf("unsized View should return empty string, got %q", got)
+func TestRenderFrame_EarlyReturnWhenUnsized(t *testing.T) {
+	m := &Model{editor: &fakeEditor{}, width: 0, height: 0}
+	if got := m.renderFrame(); got != "" {
+		t.Errorf("unsized renderFrame should return empty string, got %q", got)
 	}
 }
 
@@ -572,7 +588,7 @@ func TestRenderStatusBar_DropsSegmentsWhenMiddleOverflows(t *testing.T) {
 		{Plugin: "p", Name: "e", Text: "EEEE"},
 	}
 	m := &Model{
-		editor:         newEditor("", ""),
+		editor:         &fakeEditor{},
 		width:          40,
 		height:         24,
 		openPath:       "a/path.go",

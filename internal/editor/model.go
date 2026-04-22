@@ -9,9 +9,8 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/kujtimiihoxha/vimtea"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/savimcio/nistru/internal/config"
 	"github.com/savimcio/nistru/internal/plugins/autoupdate"
@@ -59,8 +58,8 @@ type statusSegment struct {
 }
 
 // Model is the top-level app model. It owns the plugin host (which owns the
-// left-pane plugin), the vimtea editor, focus routing, window size, and the
-// autosave/change-debounce bookkeeping.
+// left-pane plugin), the Editor (goeditor-backed via goeditorAdapter), focus
+// routing, window size, and the autosave/change-debounce bookkeeping.
 type Model struct {
 	root string
 	cfg  *config.Config
@@ -77,7 +76,7 @@ type Model struct {
 	// plugin name for in-place updates.
 	statusSegments []statusSegment
 
-	editor vimtea.Editor
+	editor Editor
 	focus  focus
 
 	width  int
@@ -203,10 +202,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.lastPaneH = contentH
 			}
 		}
-		newEd, cmd := m.editor.SetSize(editorW, contentH)
-		if e, ok := newEd.(vimtea.Editor); ok {
-			m.editor = e
-		}
+		cmd := m.editor.SetSize(editorW, contentH)
 		return m, cmd
 
 	case openFileRequestMsg:
@@ -238,7 +234,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		effs := m.host.Emit(plugin.DidChange{
 			Path: m.openPath,
-			Text: m.editor.GetBuffer().Text(),
+			Text: m.editor.Content(),
 		})
 		cmd := m.applyEffects(effs)
 		return m, cmd
@@ -268,7 +264,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// v1: model logic doesn't use plugin responses directly. Re-arm.
 		return m, m.host.Recv()
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
 
@@ -415,20 +411,29 @@ func (m *Model) handlePluginReq(msg plugin.PluginReqMsg) (tea.Model, tea.Cmd) {
 			})
 			return m, m.host.Recv()
 		}
-		m.editor = newEditor(p.Text, p.Path, m.editorOptsFromCfg())
+		// Swap the buffer in place on the existing editor — same lifecycle
+		// reasoning as openFile (F2.1): constructing a new adapter leaks the
+		// previous one's in-flight cmds past the replacement, and those
+		// cmds cross-contaminate the new editor via the non-key forwarding
+		// path in Update.
+		m.editor.SetContent(p.Text)
+		_ = m.editor.SetMode(ModeNormal)
 		contentH := m.height - statusBarLines
 		contentH = max(contentH, 1)
-		if newEd, _ := m.editor.SetSize(m.editorWidth(), contentH); newEd != nil {
-			if e, ok := newEd.(vimtea.Editor); ok {
-				m.editor = e
-			}
-		}
-		m.lastText = p.Text
+		_ = m.editor.SetSize(m.editorWidth(), contentH)
+		// Seed lastText from the editor's own Content() — goeditor drops any
+		// trailing newline at parse time (F.3 removed the re-append heuristic),
+		// so p.Text "formatted\n" round-trips to "formatted". Using p.Text
+		// verbatim would leave m.lastText one byte off from m.editor.Content(),
+		// and the next non-edit keystroke's dirty-diff in forwardToEditor
+		// would fire a false positive (autosave, DidChange, dirty flag).
+		// Matching openFile's seeding fixes that.
+		m.lastText = m.editor.Content()
 		m.dirty = false
 		m.saveGen++
 		m.changeGen++
 		_ = m.host.Respond(msg.Plugin, msg.ID, nil, nil)
-		return m, tea.Batch(m.editor.Init(), m.host.Recv())
+		return m, m.host.Recv()
 
 	case "openFile":
 		var p struct {
@@ -502,7 +507,7 @@ func filterSegments(s []statusSegment, pluginName string) []statusSegment {
 // When the command palette is open it consumes every key event before the
 // globals run, so Ctrl+S / Ctrl+Q are safe from being triggered by a user
 // typing into the palette's query field.
-func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.palette.open {
 		return m.handlePaletteKey(msg)
 	}
@@ -552,8 +557,8 @@ func (m *Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // executes the selected command through the plugin host. Always returns
 // immediately — while the palette is open, the editor and left pane do not
 // see keyboard input.
-func (m *Model) handlePaletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	closed, activated := m.palette.HandleKey(msg.String(), msg.Runes)
+func (m *Model) handlePaletteKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	closed, activated := m.palette.HandleKey(msg.String(), []rune(msg.Text))
 	if activated != nil {
 		result := m.host.ExecuteCommand(activated.ID, nil)
 		var cmd tea.Cmd
@@ -600,31 +605,39 @@ func (m *Model) guardedQuit() (tea.Model, tea.Cmd) {
 // forwardToFocused dispatches msg to whichever child is currently focused.
 // After forwarding to the editor, we diff the buffer against lastText to
 // decide whether to schedule a debounced autosave + change notification.
+//
+// Key messages are focus-gated (tree vs editor). Non-key messages, however,
+// are ALWAYS forwarded to the editor regardless of focus: goeditor uses
+// non-key messages (tea.Cmd ticks) to drive transient UI such as the timer
+// that clears DispatchMessage text. If we dropped those while the tree had
+// focus, status messages emitted via SetStatusMessage would stick on screen
+// forever because their clear event never arrives. Panes do not consume
+// non-key messages — they get state via OnResize / OnFocus — so the editor
+// is the correct sink for everything non-key.
 func (m *Model) forwardToFocused(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if _, isKey := msg.(tea.KeyPressMsg); !isKey {
+		var cmd tea.Cmd
+		m.editor, cmd = m.editor.Update(msg)
+		return m, cmd
+	}
+
 	if m.focus == focusTree {
 		if m.leftPane == nil {
 			return m, nil
 		}
-		key, ok := msg.(tea.KeyMsg)
-		if !ok {
-			// No legacy tree.Update — non-key messages are dropped when the
-			// tree has focus. Panes receive non-key state exclusively via
-			// OnResize / OnFocus.
-			return m, nil
-		}
+		// Safe to type-assert: we just checked msg is a KeyPressMsg above.
+		key := msg.(tea.KeyPressMsg)
 		effs := m.leftPane.HandleKey(keyEventFromTea(key))
 		return m, m.applyEffects(effs)
 	}
 
-	newEd, cmd := m.editor.Update(msg)
-	if e, ok := newEd.(vimtea.Editor); ok {
-		m.editor = e
-	}
+	var cmd tea.Cmd
+	m.editor, cmd = m.editor.Update(msg)
 
 	// Autosave + change-tick check — only meaningful when we have a file
 	// open.
 	if m.openPath != "" {
-		cur := m.editor.GetBuffer().Text()
+		cur := m.editor.Content()
 		if cur != m.lastText {
 			m.dirty = true
 			m.saveGen++
@@ -640,13 +653,15 @@ func (m *Model) forwardToFocused(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// keyEventFromTea converts a bubbletea KeyMsg into a transport-neutral
-// plugin.KeyEvent that panes can consume without importing bubbletea.
-func keyEventFromTea(msg tea.KeyMsg) plugin.KeyEvent {
+// keyEventFromTea converts a bubbletea v2 KeyPressMsg into a transport-neutral
+// plugin.KeyEvent that panes can consume without importing bubbletea. In v2
+// the old msg.Runes / msg.Alt fields are replaced by msg.Text (string) and
+// msg.Mod (KeyMod) respectively.
+func keyEventFromTea(msg tea.KeyPressMsg) plugin.KeyEvent {
 	return plugin.KeyEvent{
 		Key:   msg.String(),
-		Runes: msg.Runes,
-		Alt:   msg.Alt,
+		Runes: []rune(msg.Text),
+		Alt:   msg.Mod.Contains(tea.ModAlt),
 	}
 }
 
@@ -706,9 +721,9 @@ func (m *Model) applyEffects(effs []plugin.Effect) tea.Cmd {
 // — we duplicate the loop here rather than extract a helper, because the
 // one-line format is trivial and both call sites stay independent.
 //
-// A vimtea.Editor baked in its opts at construction time (relative numbers
-// and the Ctrl-binding keymap), so for those specific knobs we detect a
-// change and rebuild the editor instance in place. Content and file path
+// The Editor bakes in its opts at construction time (relative numbers and,
+// in future, the Ctrl-binding keymap), so for those specific knobs we detect
+// a change and rebuild the editor instance in place. Content and file path
 // are preserved; cursor position and vim mode are reset — acceptable v1
 // tradeoff, called out in the return contract.
 func (m *Model) reloadConfig() tea.Cmd {
@@ -740,15 +755,11 @@ func (m *Model) reloadConfig() tea.Cmd {
 
 	var initCmd tea.Cmd
 	if m.cfg != nil && editorKnobsChanged(oldKnobs, snapshotEditorKnobs(m.cfg)) {
-		buf := m.editor.GetBuffer().Text()
+		buf := m.editor.Content()
 		m.editor = newEditor(buf, m.openPath, m.editorOptsFromCfg())
 		contentH := m.height - statusBarLines
 		contentH = max(contentH, 1)
-		if newEd, _ := m.editor.SetSize(m.editorWidth(), contentH); newEd != nil {
-			if e, ok := newEd.(vimtea.Editor); ok {
-				m.editor = e
-			}
-		}
+		_ = m.editor.SetSize(m.editorWidth(), contentH)
 		initCmd = m.editor.Init()
 	}
 
@@ -762,8 +773,8 @@ func (m *Model) reloadConfig() tea.Cmd {
 	return msg
 }
 
-// editorKnobs is the subset of config.Config that the vimtea editor bakes in
-// at construction time — changing any of these means we must rebuild the
+// editorKnobs is the subset of config.Config that the Editor bakes in at
+// construction time — changing any of these means we must rebuild the
 // editor instance for the change to take effect.
 type editorKnobs struct {
 	relativeNumbers bool
@@ -800,10 +811,25 @@ func editorKnobsChanged(a, b editorKnobs) bool {
 }
 
 // openFile handles opening path: read the file, guard against binary/oversize
-// content, reconstruct the editor (fresh instance re-registers Ctrl bindings
-// via newEditor → addCtrlBindings), seed lastText so the newly-loaded content
-// does not immediately register as dirty, move focus to the editor, and emit
-// DidClose (for the previous file) + DidOpen to the plugin host.
+// content, swap the editor's buffer in place via SetContent, seed lastText so
+// the newly-loaded content does not immediately register as dirty, move focus
+// to the editor, and emit DidClose (for the previous file) + DidOpen to the
+// plugin host.
+//
+// The editor instance itself is reused across file opens. goeditor's Init
+// spawns a blocking channel listener, and its internal vim interpreter emits
+// timer cmds (cursor blink, DispatchMessage TTL). Constructing a fresh editor
+// on every open — as this function used to — leaked those in-flight cmds from
+// the previous adapter; when they resolved, the resulting tea.Msg reached the
+// Model and (per the non-key forwarding in Update) landed on the NEW editor,
+// producing stale state bleed across files. SetContent inside goeditor drops
+// the old buffer (history, cursor, viewport) while keeping the channel alive,
+// which is exactly the lifecycle we want.
+//
+// We also force ModeNormal post-swap because the previous implementation got
+// that for free from "new editor starts in Normal" — without the explicit
+// reset, opening a file while the prior buffer was mid-Insert would leave the
+// new file in Insert mode, which would be a UX regression.
 func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -828,9 +854,9 @@ func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 		return m, m.editor.SetStatusMessage("refusing: binary file")
 	}
 
-	// Before we swap editors, flush any unsaved edits in the currently-open
-	// file. If that flush fails, abort the open rather than silently dropping
-	// the user's work.
+	// Before we replace the buffer, flush any unsaved edits in the currently-
+	// open file. If that flush fails, abort the open rather than silently
+	// dropping the user's work.
 	if m.dirty && m.openPath != "" {
 		if err := m.flushNow(); err != nil {
 			m.statusErr = err.Error()
@@ -841,19 +867,30 @@ func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 	prevPath := m.openPath
 
 	content := string(b)
-	m.editor = newEditor(content, path, m.editorOptsFromCfg())
+	// Swap the buffer in place. goeditor's SetContent → SetBuffer resets the
+	// per-file state (history, cursor, viewport) without touching the channel
+	// Init listens on, so the lifecycle stays single-instance for the Model's
+	// lifetime. See the function doc for why we don't reconstruct.
+	m.editor.SetContent(content)
+	// Force Normal mode so opening a file mid-Insert doesn't land the user in
+	// Insert on the new buffer — previously this came free from constructing
+	// a fresh editor.
+	_ = m.editor.SetMode(ModeNormal)
 
-	// Push the current size into the new editor instance.
+	// Re-push the current size so goeditor's viewport picks up the new buffer
+	// at the correct dimensions (SetBuffer calls ScrollViewport but does not
+	// know about the outer pane's width/height).
 	contentH := m.height - statusBarLines
 	contentH = max(contentH, 1)
-	if newEd, _ := m.editor.SetSize(m.editorWidth(), contentH); newEd != nil {
-		if e, ok := newEd.(vimtea.Editor); ok {
-			m.editor = e
-		}
-	}
+	_ = m.editor.SetSize(m.editorWidth(), contentH)
 
 	m.openPath = path
-	m.lastText = content
+	// Seed lastText from the editor's actual buffer rather than the raw
+	// file bytes — goeditor does not preserve trailing newlines, so the
+	// raw content and the editor's Content() can differ by one byte on
+	// open. Using the editor's view keeps the dirty-diff honest: a freshly
+	// opened file must not register as modified until the user edits.
+	m.lastText = m.editor.Content()
 	m.dirty = false
 	m.saveGen++   // invalidate any pending save tick from before the open
 	m.changeGen++ // invalidate any pending change tick from before the open
@@ -866,19 +903,31 @@ func (m *Model) openFile(path string) (tea.Model, tea.Cmd) {
 	if prevPath != "" {
 		_ = m.host.Emit(plugin.DidClose{Path: prevPath})
 	}
+	// Publish the editor's actual buffer rather than the raw file bytes —
+	// goeditor does not preserve trailing newlines, so a plugin that caches
+	// DidOpen.Text (e.g. the bundled gofmt) would otherwise operate on stale
+	// content until the first DidChange arrived. m.lastText was seeded above
+	// from m.editor.Content(), which is the canonical view the user is
+	// editing.
 	openEffs := m.host.Emit(plugin.DidOpen{
 		Path: path,
 		Lang: langFromPath(path),
-		Text: content,
+		Text: m.lastText,
 	})
 
 	if m.leftPane != nil && prevFocus != m.focus {
 		m.leftPane.OnFocus(m.focus == focusTree)
 	}
 
-	cmds := []tea.Cmd{m.editor.Init()}
+	// No editor.Init() here: the editor is reused, and Init was already called
+	// at Model construction. Re-calling would spawn a second listener goroutine
+	// on the same channel — a subtle leak we now avoid.
+	var cmds []tea.Cmd
 	if effCmd := m.applyEffects(openEffs); effCmd != nil {
 		cmds = append(cmds, effCmd)
+	}
+	if len(cmds) == 0 {
+		return m, nil
 	}
 	return m, tea.Batch(cmds...)
 }
@@ -901,7 +950,7 @@ func (m *Model) flushNow() error {
 	if m.openPath == "" || !m.dirty {
 		return nil
 	}
-	cur := m.editor.GetBuffer().Text()
+	cur := m.editor.Content()
 	if err := atomicWriteFile(m.openPath, []byte(cur)); err != nil {
 		return err
 	}
@@ -914,7 +963,25 @@ func (m *Model) flushNow() error {
 	return nil
 }
 
-func (m *Model) View() string {
+// View composes the final terminal frame. In bubbletea v2 View returns a
+// tea.View struct whose Content holds the rendered body and whose declarative
+// fields (AltScreen, MouseMode, etc.) replace the old Program-level options.
+// We always request the alt-screen and cell-motion mouse events so the
+// runtime matches the v1 behaviour that used to live in run.go.
+func (m *Model) View() tea.View {
+	return tea.View{
+		Content:   m.renderFrame(),
+		AltScreen: true,
+		MouseMode: tea.MouseModeCellMotion,
+	}
+}
+
+// renderFrame produces the string body of the view. Split out from View so
+// tests and internal callers can inspect the raw string without having to
+// reach through the tea.View wrapper. goeditor handles width natively, so
+// there is no defensive clampPaneBox step here any more — the previous
+// stopgap is removed as part of the migration.
+func (m *Model) renderFrame() string {
 	if m.width == 0 || m.height == 0 {
 		// Pre-init render — the real view waits for the first WindowSizeMsg.
 		return ""
@@ -952,8 +1019,10 @@ func (m *Model) View() string {
 		if m.focus == focusTree {
 			treeStyle = treeStyle.BorderForeground(lipgloss.Color("205"))
 		}
-		treePane := treeStyle.Render(m.leftPane.Render(tw, contentH))
-		editorPane := editorStyle.Render(m.editor.View())
+		rawTree := m.leftPane.Render(tw, contentH)
+		rawEditor := m.editor.View()
+		treePane := treeStyle.Render(rawTree)
+		editorPane := editorStyle.Render(rawEditor)
 		content = lipgloss.JoinHorizontal(lipgloss.Top, treePane, editorPane)
 	} else {
 		content = editorStyle.Render(m.editor.View())
@@ -968,7 +1037,7 @@ func (m *Model) View() string {
 // width m.width. Plugin segments are dropped right-to-left if space is
 // insufficient after truncating the path.
 func (m *Model) renderStatusBar() string {
-	modeText := "[" + modeName(m.editor.GetMode()) + "]"
+	modeText := "[" + modeName(m.editor.Mode()) + "]"
 
 	path := m.openPath
 	if path == "" {
@@ -1065,15 +1134,15 @@ func (m *Model) renderStatusBar() string {
 	return lipgloss.NewStyle().Width(m.width).Render(row)
 }
 
-func modeName(m vimtea.EditorMode) string {
+func modeName(m Mode) string {
 	switch m {
-	case vimtea.ModeNormal:
+	case ModeNormal:
 		return "NORMAL"
-	case vimtea.ModeInsert:
+	case ModeInsert:
 		return "INSERT"
-	case vimtea.ModeVisual:
+	case ModeVisual:
 		return "VISUAL"
-	case vimtea.ModeCommand:
+	case ModeCommand:
 		return "COMMAND"
 	default:
 		return "?"

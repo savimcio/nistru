@@ -8,7 +8,10 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
+
+	"charm.land/lipgloss/v2"
 
 	"github.com/savimcio/nistru/plugin"
 )
@@ -579,5 +582,74 @@ func TestTreePane_DirsBeforeFiles(t *testing.T) {
 	}
 	if p.model.rows[2].isDir {
 		t.Fatalf("row[2] isDir = true, want false (aardvark.txt)")
+	}
+}
+
+// TestTruncateToWidth_BoxDrawingAndCombining exercises truncateToWidth against
+// the visual-width hazards that show up in tree rendering: box-drawing glyphs
+// (used by the connector art), CJK wide runes (each occupies two cells), and
+// combining marks (base + zero-width combiner — naive loops that stop on a
+// width delta can fail to make progress).
+//
+// For every row we assert three invariants:
+//  1. lipgloss.Width(got) <= width — the returned string fits the budget.
+//  2. width == 0 yields the empty string.
+//  3. The call completes in bounded time — a hang-guard via time.After catches
+//     an infinite loop rather than timing out the entire test binary.
+func TestTruncateToWidth_BoxDrawingAndCombining(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+	}{
+		{"box_horizontal_light", "──────────"},
+		{"box_horizontal_heavy", "━━━━━━━━━━"},
+		{"box_vertical_heavy", "┃┃┃┃┃"},
+		{"box_vertical_light", "│││││"},
+		{"box_tee_right", "├── foo"},
+		{"box_corner_bottom_left", "└── bar"},
+		{"box_corners_mixed", "┌──┐ baz"},
+		{"cjk_korean", "한한한한한"},
+		{"cjk_japanese", "日本語テキスト"},
+		{"cjk_mixed_ascii", "hello 日本語 world"},
+		// é as e + U+0301 combining acute accent.
+		{"combining_e_acute", "éééé"},
+		// à as a + U+0300 combining grave accent.
+		{"combining_a_grave", "àààà"},
+		// Combining mark applied to a wide base rune.
+		{"combining_on_wide", "日́本́語́"},
+		// Mixed line that resembles what treepane actually renders.
+		{"tree_line_ascii", "├── directory-name/"},
+		{"tree_line_unicode", "├── ünicode-file.txt"},
+		{"empty", ""},
+	}
+
+	widths := []int{0, 1, 2, 4, 10, 80}
+
+	for _, tc := range cases {
+		for _, w := range widths {
+			t.Run(fmt.Sprintf("%s/w=%d", tc.name, w), func(t *testing.T) {
+				done := make(chan string, 1)
+				go func() {
+					done <- truncateToWidth(tc.input, w)
+				}()
+				var got string
+				select {
+				case got = <-done:
+				case <-time.After(1 * time.Second):
+					t.Fatalf("truncateToWidth(%q, %d) did not return within 1s — likely infinite loop", tc.input, w)
+				}
+
+				if w == 0 {
+					if got != "" {
+						t.Fatalf("width=0: got %q, want empty string", got)
+					}
+					return
+				}
+
+				if gw := lipgloss.Width(got); gw > w {
+					t.Fatalf("lipgloss.Width(got)=%d > width=%d (input=%q got=%q)", gw, w, tc.input, got)
+				}
+			})
+		}
 	}
 }

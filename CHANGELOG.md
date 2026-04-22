@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- Migrate the Charm stack to v2: `charm.land/bubbletea/v2`, `charm.land/lipgloss/v2`, and `github.com/charmbracelet/x/exp/teatest/v2`. `github.com/charmbracelet/x/ansi` stays as it has no `charm.land` counterpart.
+- Replace [kujtimiihoxha/vimtea](https://github.com/kujtimiihoxha/vimtea) with [ionut-t/goeditor](https://github.com/ionut-t/goeditor) behind a narrow internal `Editor` interface (`internal/editor/editoriface.go`). The goeditor adapter (`internal/editor/goeditor_adapter.go`) owns key interception for micro-style Ctrl shortcuts and the undo/redo synthesis that vimtea previously exposed directly. Wide-line rendering is now grapheme-cluster-aware at the editor's own boundary.
+
+### Fixed
+
+- Wide-table and long-line content no longer disappears past the right edge of the editor pane. The previous `clampPaneBox` stopgap that regressed cursor visibility on long lines is removed; goeditor handles width natively.
+
+### Known
+
+- goeditor reserves a command-line row as part of its Vim-style chrome, so the editor pane now shows a blank row between goeditor's statusline and nistru's outer status bar. Row-count invariants still hold. Follow-up tracked to investigate a toggle or upstream patch; until then the blank row is intentional.
+
 
 ## [0.2.0] — 2026-04-21
 

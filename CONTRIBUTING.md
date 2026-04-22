@@ -62,7 +62,7 @@ feat(plugin): coalesce rapid DidChange events per path
 fix: close codex review findings (save/quit safety)
 test: stand up testing pyramid with CI, fuzz, and plugin harness
 docs: document the in-proc pane API
-chore(deps): bump bubbletea from 1.3.10 to 1.4.0
+chore(deps): bump bubbletea/v2 from 2.0.6 to 2.1.0
 ```
 
 For examples grounded in this repo, run `git log --oneline -20`.

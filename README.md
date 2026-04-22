@@ -160,7 +160,7 @@ Four palette commands (`Ctrl+P`) manage settings:
 | `Nistru: Reload Settings` | reparse both files, re-emit `Initialize` to activated plugins |
 | `Nistru: Show Resolved Config` | dump the fully-merged config to `<root>/.nistru/.resolved-config.toml` and open it |
 
-**Reload behaviour.** `Nistru: Reload Settings` takes effect immediately for app-level keybindings (save/quit/palette/focus), UI sizes (tree width, status fade), debounces, and plugin config (`OnConfig` is re-fired on every activated plugin). The in-editor Ctrl bindings (`ctrl+z`/`y`/`x`/`c`/`v`) and the `ui.relative_numbers` flag are baked into the underlying vim component at editor-instance construction time; when any of them changes on reload, the editor instance is rebuilt in place so the new setting is in effect without opening another file. Buffer content and the open file are preserved across the rebuild, but cursor position and vim mode reset to the top of the file in Normal mode.
+**Reload behaviour.** `Nistru: Reload Settings` takes effect immediately for app-level keybindings (save/quit/palette/focus), UI sizes (tree width, status fade), debounces, and plugin config (`OnConfig` is re-fired on every activated plugin). The in-editor Ctrl bindings (`ctrl+z`/`y`/`x`/`c`/`v`) and the `ui.relative_numbers` flag are baked into the editor adapter at construction time; when any of them changes on reload, the editor instance is rebuilt in place so the new setting is in effect without opening another file. Buffer content and the open file are preserved across the rebuild, but cursor position and vim mode reset to the top of the file in Normal mode.
 
 **Keymap unbinding.** Setting a keybinding to the empty string (e.g. `save = ""`) falls back to the default binding; there is no way to fully unbind an action today.
 
@@ -238,9 +238,9 @@ Participation is subject to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 Built on:
 
-- [charmbracelet/bubbletea](https://github.com/charmbracelet/bubbletea) — TUI runtime
-- [kujtimiihoxha/vimtea](https://github.com/kujtimiihoxha/vimtea) — modal vim editor component
-- [charmbracelet/lipgloss](https://github.com/charmbracelet/lipgloss) — layout and styling
+- [charm.land/bubbletea/v2](https://charm.land/bubbletea) — TUI runtime (Charm v2)
+- [ionut-t/goeditor](https://github.com/ionut-t/goeditor) — modal vim editor component with grapheme-cluster-aware width handling
+- [charm.land/lipgloss/v2](https://charm.land/lipgloss) — layout and styling (Charm v2)
 
 The file tree is rendered by an in-house component loaded through the plugin system.
 

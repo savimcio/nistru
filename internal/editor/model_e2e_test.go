@@ -40,11 +40,10 @@ import (
 	"time"
 	"unicode/utf8"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/charmbracelet/x/exp/teatest"
-	"github.com/kujtimiihoxha/vimtea"
+	teatest "github.com/charmbracelet/x/exp/teatest/v2"
 
 	"github.com/savimcio/nistru/internal/config"
 	"github.com/savimcio/nistru/internal/plugins/treepane"
@@ -171,8 +170,8 @@ func disableAutoupdate(t *testing.T) {
 }
 
 // newRenderedModel constructs a Model at (w,h), applies setup, and returns the
-// rendered View(). The root argument controls which workspace the tree pane
-// is rooted at.
+// rendered frame body (the string that View() wraps in a v2 tea.View struct).
+// The root argument controls which workspace the tree pane is rooted at.
 func newRenderedModel(t *testing.T, root string, w, h int, setup func(*Model)) string {
 	t.Helper()
 	// Disable the autoupdate background checker for every golden-capturing
@@ -194,7 +193,7 @@ func newRenderedModel(t *testing.T, root string, w, h int, setup func(*Model)) s
 	if setup != nil {
 		setup(m)
 	}
-	return m.View()
+	return m.renderFrame()
 }
 
 // emptyRoot returns a tempdir that contains no files. Used for snapshots that
@@ -251,6 +250,25 @@ func TestE2E_GoldenOpenGo_120x40(t *testing.T) {
 		_, _ = m.Update(openFileRequestMsg{path: path})
 	})
 	assertGolden(t, "open_go_120x40", []byte(got))
+}
+
+// TestE2E_GoldenOpenWideTable_80x24 opens the wide_table.md fixture — a
+// Markdown document whose table rows far exceed the 80-column window — and
+// captures View() so the resulting golden can be diffed against the fix for
+// the "strange scrolling" bug. The fixture (testdata/wide_table.md) is
+// staged by task T3 of the plan; copying it into a tempdir keeps paths in
+// the status bar stable across runs.
+func TestE2E_GoldenOpenWideTable_80x24(t *testing.T) {
+	root := emptyRoot(t)
+	src, err := os.ReadFile(filepath.Join("testdata", "wide_table.md"))
+	if err != nil {
+		t.Fatalf("read wide_table fixture: %v", err)
+	}
+	path := writeFile(t, root, "wide_table.md", string(src))
+	got := newRenderedModel(t, root, 80, 24, func(m *Model) {
+		_, _ = m.Update(openFileRequestMsg{path: path})
+	})
+	assertGolden(t, "open_wide_table_80x24", []byte(got))
 }
 
 func TestE2E_GoldenPaletteOpen_80x24(t *testing.T) {
@@ -412,8 +430,8 @@ func TestE2E_EditAutosaveToDisk(t *testing.T) {
 	// and flushes now). Using Ctrl+S here instead of waiting out the 250 ms
 	// autosave debounce keeps the test under the ~200 ms per-case budget.
 	tm.Type("ihello")
-	tm.Send(tea.KeyMsg{Type: tea.KeyEsc})
-	tm.Send(tea.KeyMsg{Type: tea.KeyCtrlS})
+	tm.Send(tea.KeyPressMsg{Code: tea.KeyEsc})
+	tm.Send(tea.KeyPressMsg{Code: 's', Mod: tea.ModCtrl})
 
 	// Wait for the file to pick up the edit via the autosave path. The debounce
 	// window is 250 ms; we allow generous slack for CI's scheduling jitter.
@@ -438,7 +456,7 @@ func TestE2E_EditAutosaveToDisk(t *testing.T) {
 		t.Fatalf("expected file to diverge from seed after autosave; still %q", last)
 	}
 	// Soft assertion on 'hello' presence — log only, since the exact
-	// interleaving of tea messages vs. vimtea mode transitions isn't
+	// interleaving of tea messages vs. editor mode transitions isn't
 	// deterministic enough to require an exact match in an e2e test.
 	if !strings.Contains(last, "hello") {
 		t.Logf("note: file content %q does not contain 'hello' verbatim; autosave still fired", last)
@@ -446,8 +464,8 @@ func TestE2E_EditAutosaveToDisk(t *testing.T) {
 
 	// Graceful shutdown — send Esc then Ctrl+Q so the Model's quit handler
 	// runs. teatest.WaitFinished consumes the final model.
-	tm.Send(tea.KeyMsg{Type: tea.KeyEsc})
-	tm.Send(tea.KeyMsg{Type: tea.KeyCtrlQ})
+	tm.Send(tea.KeyPressMsg{Code: tea.KeyEsc})
+	tm.Send(tea.KeyPressMsg{Code: 'q', Mod: tea.ModCtrl})
 	tm.WaitFinished(t, teatest.WithFinalTimeout(2*time.Second))
 }
 
@@ -471,9 +489,9 @@ func TestE2E_PaletteRegisteredCommandExecutes(t *testing.T) {
 	t.Cleanup(func() { _ = tm.Quit() })
 
 	// Ctrl+P opens the palette. Type "Ping" to filter. Enter activates.
-	tm.Send(tea.KeyMsg{Type: tea.KeyCtrlP})
+	tm.Send(tea.KeyPressMsg{Code: 'p', Mod: tea.ModCtrl})
 	tm.Type("Ping")
-	tm.Send(tea.KeyMsg{Type: tea.KeyEnter})
+	tm.Send(tea.KeyPressMsg{Code: tea.KeyEnter})
 
 	// After Enter the palette should close and statusErr should mention the
 	// unknown-command path (demo plugin isn't actually registered in the host).
@@ -481,15 +499,15 @@ func TestE2E_PaletteRegisteredCommandExecutes(t *testing.T) {
 	// status bar.
 	waitForOutputContains(t, tm, "unknown command", 1*time.Second)
 
-	tm.Send(tea.KeyMsg{Type: tea.KeyCtrlQ})
+	tm.Send(tea.KeyPressMsg{Code: 'q', Mod: tea.ModCtrl})
 	tm.WaitFinished(t, teatest.WithFinalTimeout(2*time.Second))
 }
 
 func TestE2E_CtrlCInInsertModeStaysAsCopyAndReturnsToNormal(t *testing.T) {
 	// Per editor.go, Ctrl+C in any mode is "copy line" — implemented via
-	// synthVimMotion, which prepends SetMode(ModeNormal). We drive that flow
-	// through a real tea.Program to confirm the buffer isn't quit and the
-	// editor ends in Normal mode.
+	// the adapter's interceptKey which emits a synth "yy" after entering
+	// Normal mode. We drive that flow through a real tea.Program to confirm
+	// the buffer isn't quit and the editor ends in Normal mode.
 	disableAutoupdate(t)
 	dir := t.TempDir()
 	path := writeFile(t, dir, "z.txt", "line1\nline2\n")
@@ -504,7 +522,7 @@ func TestE2E_CtrlCInInsertModeStaysAsCopyAndReturnsToNormal(t *testing.T) {
 	t.Cleanup(func() { _ = tm.Quit() })
 
 	// Enter insert mode, type "xyz". Note: focus after openFile is editor.
-	tm.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	tm.Send(tea.KeyPressMsg{Code: 'i', Text: "i"})
 	tm.Type("xyz")
 
 	// Before sending Ctrl+C, wait for the status bar to render INSERT — this
@@ -513,25 +531,24 @@ func TestE2E_CtrlCInInsertModeStaysAsCopyAndReturnsToNormal(t *testing.T) {
 	waitForOutputContains(t, tm, "INSERT", 1*time.Second)
 
 	// Fire Ctrl+C. In app-level handleKey Ctrl+C only quits when focus is the
-	// tree (model.go:422). Focus is editor here, so Ctrl+C is forwarded to
-	// vimtea which dispatches our registered "copy line" binding via
-	// synthVimMotion. The program must NOT quit.
-	tm.Send(tea.KeyMsg{Type: tea.KeyCtrlC})
+	// tree. Focus is editor here, so Ctrl+C is forwarded to the goeditor
+	// adapter, whose interceptKey prepends SetNormalMode + emits "yy". The
+	// program must NOT quit.
+	tm.Send(tea.KeyPressMsg{Code: 'c', Mod: tea.ModCtrl})
 
 	// Poll the rendered output for the NORMAL status segment instead of a
 	// bare sleep. The status bar is updated by model.renderStatusBar on every
-	// frame; seeing "NORMAL" proves synthVimMotion's SetMode(ModeNormal)
-	// landed. This replaces a 100 ms fixed sleep with a tight check.
+	// frame; seeing "NORMAL" proves the Normal-mode transition landed.
 	waitForOutputContains(t, tm, "NORMAL", 1*time.Second)
 
 	// On the final model we can inspect mode and buffer.
-	tm.Send(tea.KeyMsg{Type: tea.KeyCtrlQ})
+	tm.Send(tea.KeyPressMsg{Code: 'q', Mod: tea.ModCtrl})
 	fm := tm.FinalModel(t, teatest.WithFinalTimeout(2*time.Second)).(*Model)
-	buf := fm.editor.GetBuffer().Text()
+	buf := fm.editor.Content()
 	if !strings.Contains(buf, "xyz") {
 		t.Errorf("expected buffer to still contain 'xyz' after Ctrl+C; got %q", buf)
 	}
-	if mode := fm.editor.GetMode(); mode != vimtea.ModeNormal {
+	if mode := fm.editor.Mode(); mode != ModeNormal {
 		t.Errorf("mode after Ctrl+C: got %v, want ModeNormal", mode)
 	}
 }
@@ -555,10 +572,10 @@ func TestE2E_CtrlQWithDirtyBufferFlushesBeforeExit(t *testing.T) {
 
 	// Enter insert mode, type some text, and immediately request quit. The
 	// guardedQuit path must flush before tea.Quit runs.
-	tm.Send(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'i'}})
+	tm.Send(tea.KeyPressMsg{Code: 'i', Text: "i"})
 	tm.Type("DIRTY")
-	tm.Send(tea.KeyMsg{Type: tea.KeyEsc})
-	tm.Send(tea.KeyMsg{Type: tea.KeyCtrlQ})
+	tm.Send(tea.KeyPressMsg{Code: tea.KeyEsc})
+	tm.Send(tea.KeyPressMsg{Code: 'q', Mod: tea.ModCtrl})
 	tm.WaitFinished(t, teatest.WithFinalTimeout(2*time.Second))
 
 	data, err := os.ReadFile(path)
@@ -779,7 +796,7 @@ func TestE2E_OutOfProcHelloWorldRegistersCommand(t *testing.T) {
 		t.Fatalf("hello-world plugin did not register 'hello' command within 5s; commands=%v", m.host.Commands())
 	}
 
-	tm.Send(tea.KeyMsg{Type: tea.KeyCtrlQ})
+	tm.Send(tea.KeyPressMsg{Code: 'q', Mod: tea.ModCtrl})
 	tm.WaitFinished(t, teatest.WithFinalTimeout(3*time.Second))
 }
 
@@ -820,23 +837,26 @@ func TestE2E_OutOfProcGofmtReformatsBuffer(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	m.editor.GetBuffer().InsertAt(0, 0, "")
+	// We mark the model dirty directly — the content already contains what
+	// the plugin will reformat on DidSave, and goeditor's Editor interface
+	// doesn't expose an InsertAt-style seam for bumping dirty state from a
+	// test.
 	m.dirty = true
 	_, _ = m.Update(forceSaveMsg{})
 
 	want := "func f() {}"
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if strings.Contains(m.editor.GetBuffer().Text(), want) {
+		if strings.Contains(m.editor.Content(), want) {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if txt := m.editor.GetBuffer().Text(); !strings.Contains(txt, want) {
+	if txt := m.editor.Content(); !strings.Contains(txt, want) {
 		t.Fatalf("gofmt did not reformat the buffer within 5s; got %q", txt)
 	}
 
-	tm.Send(tea.KeyMsg{Type: tea.KeyCtrlQ})
+	tm.Send(tea.KeyPressMsg{Code: 'q', Mod: tea.ModCtrl})
 	tm.WaitFinished(t, teatest.WithFinalTimeout(3*time.Second))
 }
 
@@ -959,5 +979,202 @@ func repoRoot(t *testing.T) string {
 			t.Fatal("repoRoot: reached filesystem root without finding go.mod")
 		}
 		dir = parent
+	}
+}
+
+// TestE2E_ViewIdempotent_AllScenarios is a class-level regression guard for the
+// "rendering is non-deterministic / self-expanding" bug: for each snapshot
+// scenario already covered by a golden file, calling Model.View() twice in a
+// row (no Update in between) must return byte-equal output.
+//
+// Scenarios included (all drive the direct Update-path harness via
+// newRenderedModel, mirroring the golden setup exactly):
+//   - empty_80x24, empty_40x10
+//   - open_go_80x24, open_go_120x40
+//   - palette_open_80x24
+//   - treepane_expanded_80x24
+//   - long_path_truncation_40x10
+//   - open_wide_table_80x24
+//
+// Scenarios intentionally excluded:
+//   - None. Every golden in testdata/golden/ that corresponds to a
+//     direct-harness scenario is represented. The two teatest-driven flows
+//     (TestE2E_EditAutosaveToDisk, TestE2E_CtrlCInInsertMode...) are not
+//     snapshot tests and would require comparing tea.Program frames, which
+//     is not byte-stable in principle. empty_120x40, palette_filtered_80x24,
+//     and status_segments_80x24 are omitted only to keep the table focused
+//     on the eight canonical scenarios called out by the plan; each is a
+//     trivial variant of an already-covered setup.
+func TestE2E_ViewIdempotent_AllScenarios(t *testing.T) {
+	// buildModel returns a fully prepared Model at (w,h) with setup applied,
+	// paralleling newRenderedModel but returning the Model itself so the test
+	// can call View() multiple times.
+	buildModel := func(t *testing.T, root string, w, h int, setup func(*Model)) *Model {
+		t.Helper()
+		disableAutoupdate(t)
+		m, err := NewModel(root, nil)
+		if err != nil {
+			t.Fatalf("NewModel(%q): %v", root, err)
+		}
+		t.Cleanup(func() { _ = m.host.Shutdown(100 * time.Millisecond) })
+		newM, _ := m.Update(tea.WindowSizeMsg{Width: w, Height: h})
+		m = newM.(*Model)
+		if setup != nil {
+			setup(m)
+		}
+		return m
+	}
+
+	// Each scene prepares its own fixture dir (via t.TempDir) and returns a
+	// ready-to-render Model. Inlining setup per scene keeps the table
+	// self-contained and avoids cross-test coupling.
+	scenes := []struct {
+		name  string
+		w, h  int
+		build func(t *testing.T) *Model
+	}{
+		{
+			name: "empty_80x24", w: 80, h: 24,
+			build: func(t *testing.T) *Model {
+				root := emptyRoot(t)
+				return buildModel(t, root, 80, 24, nil)
+			},
+		},
+		{
+			name: "empty_40x10", w: 40, h: 10,
+			build: func(t *testing.T) *Model {
+				root := emptyRoot(t)
+				return buildModel(t, root, 40, 10, nil)
+			},
+		},
+		{
+			name: "open_go_80x24", w: 80, h: 24,
+			build: func(t *testing.T) *Model {
+				root := emptyRoot(t)
+				path := smallGoFixture(t, root)
+				return buildModel(t, root, 80, 24, func(m *Model) {
+					_, _ = m.Update(openFileRequestMsg{path: path})
+				})
+			},
+		},
+		{
+			name: "open_go_120x40", w: 120, h: 40,
+			build: func(t *testing.T) *Model {
+				root := emptyRoot(t)
+				path := smallGoFixture(t, root)
+				return buildModel(t, root, 120, 40, func(m *Model) {
+					_, _ = m.Update(openFileRequestMsg{path: path})
+				})
+			},
+		},
+		{
+			name: "palette_open_80x24", w: 80, h: 24,
+			build: func(t *testing.T) *Model {
+				root := emptyRoot(t)
+				return buildModel(t, root, 80, 24, func(m *Model) {
+					m.commands = map[string]plugin.CommandRef{
+						"editor.format": {Title: "Format Buffer", Plugin: "gofmt"},
+						"editor.save":   {Title: "Save File", Plugin: "core"},
+						"editor.close":  {Title: "Close Buffer", Plugin: "core"},
+					}
+					m.palette.Open(m.commands)
+				})
+			},
+		},
+		{
+			name: "treepane_expanded_80x24", w: 80, h: 24,
+			build: func(t *testing.T) *Model {
+				root := t.TempDir()
+				mustMkdir(t, filepath.Join(root, "pkg"))
+				mustMkdir(t, filepath.Join(root, "pkg", "inner"))
+				_ = writeFile(t, filepath.Join(root, "pkg"), "a.go", "package pkg\n")
+				_ = writeFile(t, filepath.Join(root, "pkg", "inner"), "b.go", "package inner\n")
+				_ = writeFile(t, root, "main.go", "package main\n")
+				return buildModel(t, root, 80, 24, func(m *Model) {
+					pane, ok := m.leftPane.(*treepane.TreePane)
+					if !ok {
+						t.Fatalf("leftPane is not *treepane.TreePane: %T", m.leftPane)
+					}
+					_ = pane.HandleKey(plugin.KeyEvent{Key: "j"})
+					_ = pane.HandleKey(plugin.KeyEvent{Key: "l"})
+					_ = pane.HandleKey(plugin.KeyEvent{Key: "j"})
+					_ = pane.HandleKey(plugin.KeyEvent{Key: "l"})
+				})
+			},
+		},
+		{
+			name: "long_path_truncation_40x10", w: 40, h: 10,
+			build: func(t *testing.T) *Model {
+				root := t.TempDir()
+				deep := filepath.Join(root, "aaaaaaaa", "bbbbbbbb", "cccccccc", "dddddddd", "eeeeeeee")
+				mustMkdir(t, deep)
+				path := writeFile(t, deep, "file.go", "package deep\n")
+				return buildModel(t, root, 40, 10, func(m *Model) {
+					_, _ = m.Update(openFileRequestMsg{path: path})
+				})
+			},
+		},
+		{
+			name: "open_wide_table_80x24", w: 80, h: 24,
+			build: func(t *testing.T) *Model {
+				root := emptyRoot(t)
+				src, err := os.ReadFile(filepath.Join("testdata", "wide_table.md"))
+				if err != nil {
+					t.Fatalf("read wide_table fixture: %v", err)
+				}
+				path := writeFile(t, root, "wide_table.md", string(src))
+				return buildModel(t, root, 80, 24, func(m *Model) {
+					_, _ = m.Update(openFileRequestMsg{path: path})
+				})
+			},
+		},
+	}
+
+	for _, sc := range scenes {
+		sc := sc
+		t.Run(sc.name, func(t *testing.T) {
+			m := sc.build(t)
+			// Use renderFrame() — the composed body string. View() returns
+			// a v2 tea.View struct whose declarative fields (AltScreen,
+			// MouseMode) are identical across back-to-back calls by
+			// construction; the bug class being guarded against is content
+			// drift in the body itself.
+			first := m.renderFrame()
+			second := m.renderFrame()
+			if first != second {
+				// Keep the log compact — full views are huge. The first
+				// diverging byte is the useful signal.
+				n := len(first)
+				if len(second) < n {
+					n = len(second)
+				}
+				div := -1
+				for i := 0; i < n; i++ {
+					if first[i] != second[i] {
+						div = i
+						break
+					}
+				}
+				if div < 0 {
+					div = n // same prefix; one is a suffix of the other
+				}
+				start := div - 40
+				if start < 0 {
+					start = 0
+				}
+				endA := div + 160
+				if endA > len(first) {
+					endA = len(first)
+				}
+				endB := div + 160
+				if endB > len(second) {
+					endB = len(second)
+				}
+				t.Fatalf("scene=%s: renderFrame() not idempotent (len1=%d len2=%d, first diff @ %d)\n--- first[%d:%d] ---\n%s\n--- second[%d:%d] ---\n%s",
+					sc.name, len(first), len(second), div,
+					start, endA, first[start:endA],
+					start, endB, second[start:endB])
+			}
+		})
 	}
 }

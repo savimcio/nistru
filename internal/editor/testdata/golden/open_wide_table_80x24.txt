@@ -1,0 +1,24 @@
+▾ 001/                       │   1 # Wide table repro
+├── README                   │   1
+└── wide_table.md            │   2 Intro paragraph with a CJK word 한 and
+                             │     combining-mark cluster café.
+                             │   3
+                             │   4 ┌────────────────────────────────────────────
+                             │     ──────────────────────────────────┐
+                             │   5 │ Banner line above the table —
+                             │     intentionally wider than any 80-col
+                             │     viewport. │
+                             │   6 └────────────────────────────────────────────
+                             │     ──────────────────────────────────┘
+                             │   7
+                             │   8 | Col A | Col B | Col C |
+                             │   9 |-------|-------|-------|
+                             │  10 | 1     | 日本語 | foo   |
+                             │  11 | 2     | 한    | bar   |
+                             │  12 | 3     | café  | baz   |
+                             │  13
+                             │  14 Another horizontal rule:
+                             │  15
+                             │ NORMAL                                       1/1
+                             │
+[NORMAL]                             wide_table.md
