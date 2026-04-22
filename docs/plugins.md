@@ -470,6 +470,19 @@ The real `autoupdate` plugin (`internal/plugins/autoupdate/`) fleshes this shape
 
 Use `PostNotif` only from in-process plugins. Out-of-process plugins already have a dedicated writer goroutine and should emit notifications via `plugsdk.Client` instead.
 
+### Release channels and asset layout
+
+The `autoupdate` plugin exposes two channels, selected per-user:
+
+| Channel | Tracks |
+|---|---|
+| `release` (default) | GitHub releases with `prerelease: false` |
+| `dev` | the newest release overall, including ones flagged `prerelease: true` |
+
+Channel selection layers (low → high): defaults → `[plugins.autoupdate] channel = "dev"` in the layered TOML config → `NISTRU_AUTOUPDATE_CHANNEL=dev` env var → the `autoupdate:switch-channel` palette command (which persists into the plugin's state file).
+
+Asset discovery on a release follows the GoReleaser default template: the plugin looks for `nistru_<version>_<os>_<arch>.tar.gz` (or `.zip` on Windows) and requires a sibling `checksums.txt` SHA-256 manifest on the same release. **It refuses to install without `checksums.txt`**; no manifest means no binary swap, and the plugin falls back to notifying with the `go install` command instead.
+
 ## Reference
 
 - Host internals: `plugin/host.go`, `plugin/extproc.go`
