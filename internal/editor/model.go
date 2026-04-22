@@ -411,16 +411,29 @@ func (m *Model) handlePluginReq(msg plugin.PluginReqMsg) (tea.Model, tea.Cmd) {
 			})
 			return m, m.host.Recv()
 		}
-		m.editor = newEditor(p.Text, p.Path, m.editorOptsFromCfg())
+		// Swap the buffer in place on the existing editor — same lifecycle
+		// reasoning as openFile (F2.1): constructing a new adapter leaks the
+		// previous one's in-flight cmds past the replacement, and those
+		// cmds cross-contaminate the new editor via the non-key forwarding
+		// path in Update.
+		m.editor.SetContent(p.Text)
+		_ = m.editor.SetMode(ModeNormal)
 		contentH := m.height - statusBarLines
 		contentH = max(contentH, 1)
 		_ = m.editor.SetSize(m.editorWidth(), contentH)
-		m.lastText = p.Text
+		// Seed lastText from the editor's own Content() — goeditor drops any
+		// trailing newline at parse time (F.3 removed the re-append heuristic),
+		// so p.Text "formatted\n" round-trips to "formatted". Using p.Text
+		// verbatim would leave m.lastText one byte off from m.editor.Content(),
+		// and the next non-edit keystroke's dirty-diff in forwardToEditor
+		// would fire a false positive (autosave, DidChange, dirty flag).
+		// Matching openFile's seeding fixes that.
+		m.lastText = m.editor.Content()
 		m.dirty = false
 		m.saveGen++
 		m.changeGen++
 		_ = m.host.Respond(msg.Plugin, msg.ID, nil, nil)
-		return m, tea.Batch(m.editor.Init(), m.host.Recv())
+		return m, m.host.Recv()
 
 	case "openFile":
 		var p struct {

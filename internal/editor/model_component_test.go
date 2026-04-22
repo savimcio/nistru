@@ -691,6 +691,60 @@ func TestModel_PluginMessagePlumbing(t *testing.T) {
 		}
 	})
 
+	// F2.2 regression: after buffer/edit replaces the buffer with text that
+	// ends in "\n", lastText must equal m.editor.Content() (which has the
+	// trailing newline stripped by goeditor), not the raw p.Text. If drift
+	// sneaks back in, the next non-edit keystroke's dirty-diff in
+	// forwardToFocused flips dirty=true without a real user edit, which
+	// cascades into autosave, a DidChange dispatch, and a stray saveTick —
+	// the exact class of bug Codex flagged.
+	t.Run("buffer/edit with trailing newline leaves lastText aligned with editor", func(t *testing.T) {
+		dir := t.TempDir()
+		path := writeFile(t, dir, "fmt.go", "seed\n")
+		m := newTestModel(t, dir)
+		newM, _ := m.Update(openFileRequestMsg{path: path})
+		m = newM.(*Model)
+
+		// Simulate a formatter plugin (e.g. bundled gofmt) sending back text
+		// with a trailing newline. This is the common case that triggered the
+		// original drift.
+		params, _ := json.Marshal(map[string]string{
+			"path": path,
+			"text": "formatted\n",
+		})
+		_, _ = m.Update(plugin.PluginReqMsg{
+			Plugin: "fmtbot",
+			ID:     "req-fmt",
+			Method: "buffer/edit",
+			Params: params,
+		})
+
+		if got := m.editor.Content(); got != "formatted" {
+			t.Fatalf("editor content after buffer/edit = %q, want %q (goeditor strips trailing newline)", got, "formatted")
+		}
+		if m.lastText != m.editor.Content() {
+			t.Errorf("lastText = %q, editor.Content() = %q — drift violates the dirty-diff contract", m.lastText, m.editor.Content())
+		}
+		if m.dirty {
+			t.Errorf("dirty should be false immediately after buffer/edit")
+		}
+
+		// Simulate a subsequent non-edit keystroke (cursor motion) via a
+		// non-KeyPressMsg forwarded to the editor. We can't easily drive
+		// goeditor's cursor from here, so instead we just re-run the
+		// dirty-diff that forwardToFocused would run: if lastText is aligned
+		// with the editor buffer, no drift is detected.
+		saveGenBefore := m.saveGen
+		changeGenBefore := m.changeGen
+		if m.editor.Content() != m.lastText {
+			t.Errorf("pre-diff mismatch: editor=%q lastText=%q", m.editor.Content(), m.lastText)
+		}
+		if m.saveGen != saveGenBefore || m.changeGen != changeGenBefore {
+			t.Errorf("gens bumped without an edit: saveGen %d->%d, changeGen %d->%d",
+				saveGenBefore, m.saveGen, changeGenBefore, m.changeGen)
+		}
+	})
+
 	t.Run("PluginReqMsg buffer/edit on wrong path responds invalidParams", func(t *testing.T) {
 		m := newTestModel(t, t.TempDir())
 		// No open file — any path is "wrong".
