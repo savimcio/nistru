@@ -91,9 +91,11 @@ func TestGoeditorAdapter_ModeRoundTrip(t *testing.T) {
 	}
 }
 
-// SetMode(ModeCommand) is the nistru-level hack: goeditor has no "command"
-// slot, so we map to Normal and emit a status-message cmd so the UI can
-// still flash a ":" prompt.
+// SetMode(ModeCommand) is the nistru-level hack: goeditor has no matching
+// SetCommandMode entry point from outer callers, so we fall back to Normal
+// and emit a status-message cmd so the UI can still flash a ":" prompt.
+// The adapter also stashes modeHint = ModeCommand so the follow-up Mode()
+// read reflects the caller's intent.
 func TestGoeditorAdapter_ModeCommandMapsToNormalWithStatusCmd(t *testing.T) {
 	a := newGoeditorAdapter("", "x", false, nil)
 
@@ -106,6 +108,44 @@ func TestGoeditorAdapter_ModeCommandMapsToNormalWithStatusCmd(t *testing.T) {
 	}
 	if !a.inner.IsNormalMode() {
 		t.Errorf("inner editor should be in Normal mode when ModeCommand is set; IsNormalMode() = false")
+	}
+}
+
+// F2.3 regression: Mode() must surface goeditor's own command mode, not
+// just the nistru-level SetMode(ModeCommand) path. Pressing ":" in Normal
+// mode transitions goeditor's inner editor into CommandMode (via core's
+// normal_mode.go switch on key.Rune == ':'); previously Mode() only
+// consulted modeHint, which was never set along that path, so the outer
+// status bar rendered "[NORMAL]" while the user was typing ":w". Now
+// Mode() reads IsCommandMode() directly.
+func TestGoeditorAdapter_ModeReportsGoeditorCommandMode(t *testing.T) {
+	a := newGoeditorAdapter("", "hello", false, nil)
+
+	if got := a.Mode(); got != ModeNormal {
+		t.Fatalf("pre: Mode() = %v, want ModeNormal", got)
+	}
+
+	// goeditor's convertBubbleKey reads key.Text for the rune when there's
+	// no matching tea.Key constant. A ":" keypress is a plain-rune event.
+	colon := tea.KeyPressMsg{Code: ':', Text: ":"}
+	_, _ = a.Update(colon)
+
+	if !a.inner.IsCommandMode() {
+		t.Fatalf("goeditor did not enter command mode after ':' keypress — Update plumbing changed?")
+	}
+	if got := a.Mode(); got != ModeCommand {
+		t.Errorf("after ':': Mode() = %v, want ModeCommand (from IsCommandMode())", got)
+	}
+
+	// Esc returns goeditor to normal. The adapter should report ModeNormal
+	// again — modeHint was never set along the ":" path, so nothing sticks.
+	esc := tea.KeyPressMsg{Code: tea.KeyEscape}
+	_, _ = a.Update(esc)
+	if a.inner.IsCommandMode() {
+		t.Fatalf("goeditor still reports IsCommandMode after Esc — upstream contract changed?")
+	}
+	if got := a.Mode(); got != ModeNormal {
+		t.Errorf("after Esc: Mode() = %v, want ModeNormal", got)
 	}
 }
 

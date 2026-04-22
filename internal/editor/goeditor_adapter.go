@@ -128,16 +128,27 @@ func (a *goeditorAdapter) Content() string {
 }
 
 // Mode maps goeditor's boolean accessors into our enum. We check Insert and
-// Visual explicitly; anything else is reported as Normal (this includes
-// goeditor's own command/search modes, which nistru does not surface).
-// ModeCommand is stashed in modeHint and only reported when the caller
-// explicitly asked for it via SetMode — goeditor itself has no concept.
+// Visual explicitly; anything else is reported as Normal.
+//
+// ModeCommand has two entry paths we need to report. The first is the
+// nistru-level SetMode(ModeCommand) path: outer callers (palette, synthetic
+// command dispatch) set modeHint = ModeCommand, and Mode() reports it while
+// goeditor itself sits in Normal. The second is goeditor's own command
+// mode — pressing ":" from Normal inside goeditor transitions its inner
+// editor state into CommandMode, reported via IsCommandMode(). Previously
+// we only surfaced the first path; the second is what the user actually
+// hits when they type ":w" to save, and the status bar read "[NORMAL]"
+// while they were typing the command. F2.3 fixes that by reading
+// IsCommandMode() directly.
 func (a *goeditorAdapter) Mode() Mode {
 	if a.inner.IsInsertMode() {
 		return ModeInsert
 	}
 	if a.inner.IsVisualMode() || a.inner.IsVisualLineMode() {
 		return ModeVisual
+	}
+	if a.inner.IsCommandMode() {
+		return ModeCommand
 	}
 	if a.modeHint == ModeCommand && a.inner.IsNormalMode() {
 		return ModeCommand
