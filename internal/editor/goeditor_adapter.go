@@ -167,6 +167,22 @@ func (a *goeditorAdapter) CursorRowCol() (row, col int) {
 	return p.Row, p.Col
 }
 
+// undoKeyMsg is the synth KeyPressMsg that represents a vim 'u' keypress as
+// goeditor's convertBubbleKey expects it (Text carries the rune). Extracted
+// for test introspection.
+func undoKeyMsg() tea.KeyPressMsg {
+	return tea.KeyPressMsg{Code: 'u', Text: "u"}
+}
+
+// redoKeyMsg is the synth KeyPressMsg that represents a vim 'U' (uppercase)
+// keypress. goeditor's vim interpreter maps redo to uppercase U — not Ctrl+R
+// — and its convertBubbleKey reads key.Text for the rune, so Text must be "U".
+// ShiftedCode/BaseCode mirror what a real keyboard press of Shift+u produces
+// and keeps the event shape consistent with upstream expectations.
+func redoKeyMsg() tea.KeyPressMsg {
+	return tea.KeyPressMsg{Code: 'U', Text: "U", ShiftedCode: 'U', BaseCode: 'u'}
+}
+
 // Undo synthesises the vim 'u' keypress in Normal mode. goeditor has no
 // public Undo() method, but its built-in vim interpreter handles 'u' as
 // undo. We ensure Normal mode first so 'u' is not treated as literal text
@@ -174,19 +190,15 @@ func (a *goeditorAdapter) CursorRowCol() (row, col int) {
 func (a *goeditorAdapter) Undo() tea.Cmd {
 	return tea.Sequence(
 		a.cmdEnterNormal(),
-		func() tea.Msg {
-			return tea.KeyPressMsg{Code: 'u', Text: "u"}
-		},
+		func() tea.Msg { return undoKeyMsg() },
 	)
 }
 
-// Redo synthesises Ctrl+R, which goeditor's vim interpreter handles as redo.
+// Redo synthesises the vim 'U' (uppercase) keypress in Normal mode.
 func (a *goeditorAdapter) Redo() tea.Cmd {
 	return tea.Sequence(
 		a.cmdEnterNormal(),
-		func() tea.Msg {
-			return tea.KeyPressMsg{Code: 'r', Mod: tea.ModCtrl}
-		},
+		func() tea.Msg { return redoKeyMsg() },
 	)
 }
 

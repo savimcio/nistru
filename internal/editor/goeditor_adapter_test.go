@@ -180,6 +180,43 @@ func TestGoeditorAdapter_RedoReturnsNonNilCmd(t *testing.T) {
 	}
 }
 
+// Regression for F.1: Redo previously synthesised Ctrl+R, which goeditor's
+// vim interpreter silently ignored (standard vim redo is uppercase U).
+// goeditor's convertBubbleKey reads the key's Text field for the rune, so the
+// synth KeyPressMsg must carry Text == "U" to be recognised as redo.
+//
+// We introspect the synth key helpers directly rather than executing the
+// tea.Sequence returned by Redo() — the sequence's inner messages are only
+// observable to a running tea.Program, which would pull e2e machinery into a
+// unit test.
+func TestGoeditorAdapter_RedoSynthesisesUppercaseU(t *testing.T) {
+	got := redoKeyMsg()
+	if got.Text != "U" {
+		t.Errorf("redoKeyMsg().Text = %q, want %q (goeditor reads Text for the rune)", got.Text, "U")
+	}
+	if got.Code != 'U' {
+		t.Errorf("redoKeyMsg().Code = %q, want %q", got.Code, 'U')
+	}
+	if got.Mod.Contains(tea.ModCtrl) {
+		t.Errorf("redoKeyMsg().Mod contains Ctrl; goeditor's redo is uppercase U, not Ctrl+R")
+	}
+}
+
+// Sibling check for the undo synth — kept adjacent so a future refactor
+// that breaks Undo the same way Redo was broken fails loudly here.
+func TestGoeditorAdapter_UndoSynthesisesLowercaseU(t *testing.T) {
+	got := undoKeyMsg()
+	if got.Text != "u" {
+		t.Errorf("undoKeyMsg().Text = %q, want %q", got.Text, "u")
+	}
+	if got.Code != 'u' {
+		t.Errorf("undoKeyMsg().Code = %q, want %q", got.Code, 'u')
+	}
+	if got.Mod.Contains(tea.ModCtrl) {
+		t.Errorf("undoKeyMsg().Mod contains Ctrl; vim undo is plain 'u'")
+	}
+}
+
 // synthVimMotion must produce a cmd that, under tea.Sequence, emits the
 // requested runes in order. We execute the inner cmds and collect the
 // resulting messages to verify.
