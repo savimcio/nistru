@@ -5,6 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 > **Status:** pre-1.0 — actively developed; APIs and plugin manifest schema may break before `v1.0`.
+> **Roadmap:** see [`docs/ROADMAP.md`](docs/ROADMAP.md) for the path to v1.0 (milestones `v0.3` → `v0.6`).
 
 A minimal terminal text editor with a file-tree sidebar, modal vim-style editing, micro-inspired `Ctrl` shortcuts, and a plugin system for formatters, linters, and custom panes.
 
