@@ -17,8 +17,10 @@ A minimal terminal text editor with a file-tree sidebar, modal vim-style editing
 ### Homebrew (macOS + Linux)
 
 ```sh
-brew install savimcio/homebrew-tap/nistru
+brew install savimcio/tap/nistru
 ```
+
+The tap repo is [`savimcio/homebrew-tap`](https://github.com/savimcio/homebrew-tap); Homebrew strips the `homebrew-` prefix, so `savimcio/tap` is the short form used with `brew`.
 
 The formula tracks stable releases; `brew upgrade nistru` picks up new versions.
 
