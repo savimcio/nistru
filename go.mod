@@ -9,7 +9,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/charmbracelet/x/exp/teatest/v2 v2.0.0-20260420102150-fe550f2efce5
 	github.com/ionut-t/goeditor v0.4.11
-	golang.org/x/mod v0.31.0
+	golang.org/x/mod v0.35.0
 	honnef.co/go/tools v0.7.0
 )
 
@@ -35,5 +35,5 @@ require (
 	golang.org/x/exp/typeparams v0.0.0-20231108232855-2478ac86f678 // indirect
 	golang.org/x/sync v0.20.0 // indirect
 	golang.org/x/sys v0.43.0 // indirect
-	golang.org/x/tools v0.40.1-0.20260108161641-ca281cf95054 // indirect
+	golang.org/x/tools v0.43.0 // indirect
 )
