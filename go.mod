@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	charm.land/bubbletea/v2 v2.0.6
 	charm.land/lipgloss/v2 v2.0.3
-	github.com/BurntSushi/toml v1.4.1-0.20240526193622-a339e1f7089c
+	github.com/BurntSushi/toml v1.6.0
 	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/charmbracelet/x/exp/teatest/v2 v2.0.0-20260420102150-fe550f2efce5
 	github.com/ionut-t/goeditor v0.4.11
